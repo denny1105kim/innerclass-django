@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Django OK</title>
+    {% load static %}
+    <link rel="stylesheet" href="{% static 'css/health.css' %}">
+</head>
+<body>
+    <div class="container">
+        <h1>✅ Django is working</h1>
+        <p>Django 테스트 확인.</p>
+
+        <div class="info">
+            <p><strong>App:</strong> main</p>
+            <p><strong>Template:</strong> main/health_check.html</p>
+            <p><strong>Static:</strong> main/static/css/health.css</p>
+        </div>
+    </div>
+</body>
+</html>

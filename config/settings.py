@@ -33,8 +33,15 @@ ALLOWED_HOSTS = [
     if h.strip()
 ]
 
-# Application definition
+#https/proxy(using in deployment)
+USE_HTTPS = os.environ.get("DJANGO_USE_HTTPS", "false").lower() == "true"
 
+if USE_HTTPS:
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+# Application definition
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",

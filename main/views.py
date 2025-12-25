@@ -1,5 +1,4 @@
-from django.shortcuts import render
+from django.http import JsonResponse
 
-# Create your views here.
-def health_check(request):
-    return render(request, "main/health_check.html")
+def health(request):
+    return JsonResponse({"ok": True})

@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 from pathlib import Path
 import os
 from dotenv import load_dotenv
+from datetime import timedelta
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -50,9 +51,15 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "main",
+
+    "corsheaders",
+    "rest_framework",
+    "rest_framework_simplejwt",
+    "auth_app",
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -132,3 +139,32 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = "static/"
+
+
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",    # 로컬 개발용 React 주소
+    "https://swjbs.com",        # 배포용 주소
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:5173",
+    "https://swjbs.com", 
+]
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    )
+}
+
+SIMPLE_JWT = {
+    # 액세스 토큰 수명 (보통 30분~1시간)
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
+    # 리프레시 토큰 수명 (보통 1일~2주, 재로그인 없이 연장용)
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
+    
+    # 보안 키 (Django 시크릿 키 사용)
+    'SIGNING_KEY': os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-key'),
+    'ALGORITHM': 'HS256',
+    'AUTH_HEADER_TYPES': ('Bearer',),
+}

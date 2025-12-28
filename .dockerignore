@@ -1,0 +1,23 @@
+# 1. DB 데이터 (가장 중요! 에러의 원인)
+postgres_data/
+
+# 2. 가상환경 폴더 (도커 안에서는 필요 없음)
+my_env/
+venv/
+env/
+
+# 3. 깃 관리 폴더
+.git/
+.gitignore
+
+# 4. 파이썬 캐시 파일
+__pycache__/
+*.pyc
+*.pyo
+
+# 5. 환경변수 파일 (이미지에 들어가면 보안 사고!)
+.env
+.env.local
+
+# 6. 기타 OS 파일
+.DS_Store

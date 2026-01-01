@@ -65,6 +65,37 @@ class GoogleLoginView(APIView):
             'refresh': str(refresh),
             'user': {
                 'email': user.email,
-                'name': user.first_name
+                'name': user.first_name if user.first_name else user.email.split('@')[0],
+                'has_profile': UserProfile.objects.filter(user=user).exists()
             }
         }, status=status.HTTP_200_OK)
+
+from rest_framework.permissions import IsAuthenticated
+from .serializers import UserProfileSerializer
+from .models import UserProfile
+
+class OnboardingView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            profile = request.user.profile
+            serializer = UserProfileSerializer(profile)
+            return Response(serializer.data)
+        except UserProfile.DoesNotExist:
+            return Response({}, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = UserProfileSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class UserWithdrawalView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request):
+        user = request.user
+        user.delete()
+        return Response({"message": "회원탈퇴가 완료되었습니다."}, status=status.HTTP_204_NO_CONTENT)

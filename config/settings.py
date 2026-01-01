@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
     "rest_framework_simplejwt",
+    "django.contrib.postgres",
     "auth_app",
 ]
 

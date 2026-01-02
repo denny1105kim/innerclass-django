@@ -19,3 +19,5 @@ pandas
 pykrx
 setuptools
 yfinance
+google-genai
+

@@ -49,3 +49,33 @@ class DailyStockSnapshot(models.Model):
             models.Index(fields=["date", "market_cap"]),
             models.Index(fields=["date", "intraday_pct"]),
         ]
+
+
+class PromptTemplate(models.Model):
+    """Reusable prompt template for the chatbot.
+
+    - system_prompt: injected as the system message
+    - user_prompt_template: formatted with {message} and sent as the user message
+    """
+
+    key = models.SlugField(max_length=64, unique=True)
+    name = models.CharField(max_length=128)
+    description = models.TextField(blank=True, default="")
+
+    system_prompt = models.TextField(blank=True, default="")
+    user_prompt_template = models.TextField(
+        blank=True,
+        default="{message}",
+        help_text="Use {message} placeholder for the user's input.",
+    )
+
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at", "name"]
+
+    def __str__(self) -> str:
+        return f"{self.key} ({'active' if self.is_active else 'inactive'})"

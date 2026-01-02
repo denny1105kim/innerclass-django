@@ -1,18 +1,81 @@
 from __future__ import annotations
 
 from datetime import date as _date
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
 from django.conf import settings
+from django.core.paginator import EmptyPage, Paginator
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from .models import DailyStockSnapshot, Market, PromptTemplate
+from .models import (
+    ChatMessage as ChatLog,
+    ChatSession,
+    DailyStockSnapshot,
+    Market,
+    PromptTemplate,
+)
 from .services.gemini_client import ChatMessage, get_gemini_client
+
+
+# -----------------------------
+# Chat persistence settings
+# -----------------------------
+
+CHAT_RETENTION_DAYS = 3
+CHAT_MAX_MESSAGE_CHARS = 2000
+CHAT_CONTEXT_MESSAGES = 30  # LLM cost control (최근 N개만 컨텍스트로)
+CHAT_SESSION_PAGE_THRESHOLD = 100  # if > 100 msgs, pagination becomes relevant
+CHAT_PAGE_SIZE_DEFAULT = 50
+CHAT_PAGE_SIZE_MAX = 100
+
+
+def _chat_cleanup_retention() -> None:
+    """Hard-delete chat logs older than retention window, and prune empty sessions."""
+    cutoff = timezone.now() - timedelta(days=CHAT_RETENTION_DAYS)
+
+    # Delete old messages
+    ChatLog.objects.filter(created_at__lt=cutoff).delete()
+
+    # Remove sessions with no remaining messages
+    # NOTE: related_name="messages" 가 ChatSession <-> ChatLog 에 걸려있다는 가정
+    ChatSession.objects.filter(messages__isnull=True).delete()
+
+
+def _make_session_title(first_user_message: str, max_len: int = 28) -> str:
+    """
+    세션 타이틀: 첫 질문을 요약(비용 0, LLM 호출 없음)
+    - 공백 정규화
+    - max_len 초과 시 … 처리
+    """
+    t = " ".join((first_user_message or "").strip().split())
+    if not t:
+        return "새 대화"
+    return t if len(t) <= max_len else (t[: max_len - 1] + "…")
+
+
+def _serialize_session(s: ChatSession) -> Dict[str, Any]:
+    return {
+        "id": s.id,
+        "title": s.title,
+        "template_id": s.template_id,
+        "updated_at": s.updated_at.isoformat(),
+        "created_at": s.created_at.isoformat(),
+    }
+
+
+def _serialize_chatlog(m: ChatLog) -> Dict[str, Any]:
+    return {
+        "id": m.id,
+        "role": m.role,
+        "content": m.content,
+        "created_at": m.created_at.isoformat(),
+    }
 
 
 # -----------------------------
@@ -52,45 +115,44 @@ def today_market(request: Request):
         target = timezone.localdate()
 
     asof = (
-        DailyStockSnapshot.objects
-        .filter(stock__market=market, date__lte=target)
+        DailyStockSnapshot.objects.filter(stock__market=market, date__lte=target)
         .order_by("-date")
         .values_list("date", flat=True)
         .first()
     )
 
     if not asof:
-        return Response({
-            "market": market,
-            "asof": target.isoformat(),
-            "top_market_cap": [],
-            "top_drawdown": [],
-        })
+        return Response(
+            {
+                "market": market,
+                "asof": target.isoformat(),
+                "top_market_cap": [],
+                "top_drawdown": [],
+            }
+        )
 
     base_qs = (
-        DailyStockSnapshot.objects
-        .select_related("stock")
+        DailyStockSnapshot.objects.select_related("stock")
         .filter(stock__market=market, date=asof)
     )
 
     top_market_cap = base_qs.exclude(market_cap__isnull=True).order_by("-market_cap")[:5]
     top_drawdown = base_qs.exclude(intraday_pct__isnull=True).order_by("intraday_pct")[:5]
 
-    return Response({
-        "market": market,
-        "asof": asof.isoformat(),
-        "top_market_cap": [_serialize_snapshot(x) for x in top_market_cap],
-        "top_drawdown": [_serialize_snapshot(x) for x in top_drawdown],
-    })
+    return Response(
+        {
+            "market": market,
+            "asof": asof.isoformat(),
+            "top_market_cap": [_serialize_snapshot(x) for x in top_market_cap],
+            "top_drawdown": [_serialize_snapshot(x) for x in top_drawdown],
+        }
+    )
 
 
 # -----------------------------
 # Chatbot - Prompt helpers
 # -----------------------------
 
-# 금융/주식 도메인 안전 규칙(출력에 "투자 권유 아님" 문구 강제 X)
-# - 대신 과도한 확신/수익보장/루머단정 금지 유지
-# - "추천" 요청이면 반드시 종목을 직접 제시하도록 별도 Recommendation Policy로 강제
 FALLBACK_DOMAIN_GUARDRAILS = """
 당신은 금융/주식 도메인의 응답을 생성하는 어시스턴트다.
 
@@ -98,32 +160,16 @@ FALLBACK_DOMAIN_GUARDRAILS = """
 - 수익 보장/확실/무조건 같은 단정적 수익 약속 금지.
 - 근거 없는 루머/미확인 사실 단정 금지. 사실/추정/의견을 구분.
 - 장점만 나열하지 말고 리스크(하락 요인) 1~2개를 반드시 포함.
-- 에둘러 말하지 말 것. 질문이 "추천"이면 종목을 바로 제시할 것.
+- 에둘러 말하지 말 것. 질문이 "추천"이면 종목을 직접 제시할 것.
 """.strip()
 
 
 def _get_default_template() -> Optional[PromptTemplate]:
     return (
-        PromptTemplate.objects
-        .filter(is_active=True)
+        PromptTemplate.objects.filter(is_active=True)
         .order_by("-updated_at", "-id")
         .first()
     )
-
-
-def _safe_history(raw: Any) -> List[ChatMessage]:
-    msgs: List[ChatMessage] = []
-    if not isinstance(raw, list):
-        return msgs
-
-    for item in raw[-20:]:
-        if not isinstance(item, dict):
-            continue
-        role = (item.get("role") or "").strip()
-        content = (item.get("content") or "").strip()
-        if role in ("user", "assistant") and content:
-            msgs.append(ChatMessage(role=role, content=content))
-    return msgs
 
 
 def _risk_profile_text(code: str) -> str:
@@ -158,10 +204,6 @@ def _clamp_level(level: int) -> int:
 
 
 def _level_system_instruction(level: int) -> str:
-    """
-    Level 1~5 페르소나/형식. 단, "추천 요청 시 추천을 해야 한다"는 정책을
-    별도 Recommendation Policy에서 강제한다.
-    """
     level = _clamp_level(level)
 
     if level == 1:
@@ -171,13 +213,12 @@ Role: 주식 투자를 처음 시작한 입문자를 돕는 튜터.
 
 Tone & Manner:
 - 친절한 해요체 사용.
-- 문장마다 이모지 필수.
 - 어려운 개념은 일상 비유로 설명.
 
 Constraints:
 - 전문 용어/약어 남발 금지(필요 시 아주 쉬운 말로 즉시 풀어쓰기).
 - 에둘러 말하지 말 것: 질문이 요구하는 결과를 먼저 제시.
-- 마지막 문장은 행동지침 1줄로 끝낼 것(예: 오늘 체크할 것/조심할 것).
+- 마지막 문장은 행동지침 1줄로 끝낼 것.
 
 Response Format:
 - 4~8문장.
@@ -300,16 +341,18 @@ def _build_user_context_from_payload(profile_data: Dict[str, Any]) -> str:
   체크 포인트(실적/이슈/수급) 1~2개를 포함할 것.
 """.strip()
 
-    return "\n".join([
-        "[User Profile]",
-        f"- Asset Type: {asset_type}",
-        f"- Interested Sectors: {sectors_csv}",
-        f"- Risk Profile: {_risk_profile_text(risk)}",
-        f"- Knowledge Level: Level {level}",
-        f"- Portfolio: {portfolio_csv}",
-        "",
-        portfolio_rule,
-    ]).strip()
+    return "\n".join(
+        [
+            "[User Profile]",
+            f"- Asset Type: {asset_type}",
+            f"- Interested Sectors: {sectors_csv}",
+            f"- Risk Profile: {_risk_profile_text(risk)}",
+            f"- Knowledge Level: Level {level}",
+            f"- Portfolio: {portfolio_csv}",
+            "",
+            portfolio_rule,
+        ]
+    ).strip()
 
 
 def _try_get_profile_via_model(request: Request) -> Optional[Dict[str, Any]]:
@@ -368,33 +411,36 @@ def _get_user_profile_data(request: Request) -> Optional[Dict[str, Any]]:
 
 
 def _is_recommendation_intent(message: str) -> bool:
-    """
-    추천/픽/살만한/사야할/매수할/탑픽 등 '추천' 의도를 감지.
-    """
     m = (message or "").strip().lower()
     keys = [
-        "추천", "추천주", "종목 추천", "오늘 추천", "오늘의 추천",
-        "top pick", "pick", "picks", "살만", "사야", "매수", "사면", "사볼", "담을"
+        "추천",
+        "추천주",
+        "종목 추천",
+        "오늘 추천",
+        "오늘의 추천",
+        "top pick",
+        "pick",
+        "picks",
+        "살만",
+        "사야",
+        "매수",
+        "사면",
+        "사볼",
+        "담을",
     ]
     return any(k.lower() in m for k in keys)
 
 
 def _recommendation_policy(level: int) -> str:
-    """
-    추천 요청 시: 무조건 종목을 명시하게 만드는 강제 정책.
-    - "에둘러 말하지 말라"를 시스템에서 강제
-    - 출력 포맷을 고정해 모델이 우회하지 못하게 함
-    """
     level = _clamp_level(level)
 
-    # 레벨별로 말투만 다르고, '추천을 반드시 주기'는 공통으로 강제
     if level == 1:
         return """
 [Recommendation Policy]
-- 사용자가 추천을 요구하면, 첫 문장에서 국내 주식 종목 2~3개를 '오늘의 추천'으로 바로 제시할 것. 😲
-- 에둘러 말하지 말고, 종목명부터 말할 것. 👀
-- 각 종목마다 이유 1줄 + 오늘 체크할 포인트 1줄을 붙일 것. 📌
-- 마지막 문장은 행동지침 1줄로 끝낼 것. 🧭
+- 사용자가 추천을 요구하면, 첫 문장에서 국내 주식 종목 2~3개를 '오늘의 추천'으로 바로 제시할 것.
+- 에둘러 말하지 말고, 종목명부터 말할 것.
+- 각 종목마다 이유 1줄 + 오늘 체크할 포인트 1줄을 붙일 것.
+- 마지막 문장은 행동지침 1줄로 끝낼 것.
 """.strip()
 
     if level == 2:
@@ -450,16 +496,99 @@ def chatbot_prompts(request: Request):
     return Response({"templates": templates})
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def chatbot_sessions(request: Request):
+    """List user's chat sessions (latest first). Retention cleanup runs on access."""
+    _chat_cleanup_retention()
+
+    try:
+        limit = int(request.query_params.get("limit", 20))
+    except Exception:
+        limit = 20
+    limit = max(1, min(50, limit))
+
+    qs = ChatSession.objects.filter(user=request.user).order_by("-updated_at", "-id")[:limit]
+    return Response({"sessions": [_serialize_session(s) for s in qs]})
+
+
+@api_view(["GET", "DELETE"])
+@permission_classes([IsAuthenticated])
+def chatbot_session_detail(request: Request, session_id: int):
+    """Get messages for a session (paginated) or delete the session."""
+    _chat_cleanup_retention()
+
+    try:
+        session = ChatSession.objects.get(id=session_id, user=request.user)
+    except ChatSession.DoesNotExist:
+        return Response({"detail": "Session not found"}, status=404)
+
+    if request.method == "DELETE":
+        session.delete()
+        return Response({"ok": True})
+
+    # Pagination (newest-first)
+    try:
+        page = int(request.query_params.get("page", 1))
+    except Exception:
+        page = 1
+    try:
+        page_size = int(request.query_params.get("page_size", CHAT_PAGE_SIZE_DEFAULT))
+    except Exception:
+        page_size = CHAT_PAGE_SIZE_DEFAULT
+
+    page = max(1, page)
+    page_size = max(1, min(CHAT_PAGE_SIZE_MAX, page_size))
+
+    base_qs = ChatLog.objects.filter(session=session).order_by("-created_at", "-id")
+    total = base_qs.count()
+    paginator = Paginator(base_qs, page_size)
+
+    try:
+        page_obj = paginator.page(page)
+    except EmptyPage:
+        return Response(
+            {
+                "session": _serialize_session(session),
+                "messages": [],
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+                "has_next": False,
+            }
+        )
+
+    return Response(
+        {
+            "session": _serialize_session(session),
+            "messages": [_serialize_chatlog(m) for m in page_obj.object_list],  # newest-first
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "has_next": page_obj.has_next(),
+            "pagination_recommended": total > CHAT_SESSION_PAGE_THRESHOLD,
+        }
+    )
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def chatbot_chat(request: Request):
+    _chat_cleanup_retention()
+
     template_id = request.data.get("template_id")
     template_key = request.data.get("template_key")
+    session_id = request.data.get("session_id")
     message = (request.data.get("message") or "").strip()
-    history = request.data.get("history") or []
 
     if not message:
         return Response({"detail": "message is required"}, status=400)
+
+    if len(message) > CHAT_MAX_MESSAGE_CHARS:
+        return Response(
+            {"detail": f"message is too long (max {CHAT_MAX_MESSAGE_CHARS})"},
+            status=400,
+        )
 
     # 1) 템플릿 선택
     template: Optional[PromptTemplate] = None
@@ -486,7 +615,20 @@ def chatbot_chat(request: Request):
     if not base_system:
         base_system = FALLBACK_DOMAIN_GUARDRAILS
 
-    # 3) 유저 프로필(온보딩) 조회
+    # 3) Session resolve/create (user-scoped)
+    if session_id:
+        try:
+            session = ChatSession.objects.get(id=int(session_id), user=request.user)
+        except Exception:
+            return Response({"detail": "Invalid session_id"}, status=400)
+    else:
+        session = ChatSession.objects.create(
+            user=request.user,
+            template=template,
+            title="",
+        )
+
+    # 4) 유저 프로필(온보딩) 조회
     profile_data = _get_user_profile_data(request)
     user_context = ""
     risk = ""
@@ -496,15 +638,12 @@ def chatbot_chat(request: Request):
         risk = (profile_data.get("riskProfile") or profile_data.get("risk_profile") or "").strip()
         level = _clamp_level(profile_data.get("knowledgeLevel") or profile_data.get("knowledge_level") or 3)
 
-    # 4) Level + Risk
+    # 5) Level + Risk + (추천정책)
     level_inst = _level_system_instruction(level)
     risk_inst = _risk_overrides(risk) if risk else ""
-
-    # 5) 추천 의도 감지 시: 추천 정책을 추가로 강제
     rec_inst = _recommendation_policy(level) if _is_recommendation_intent(message) else ""
 
     # 6) system prompt 조립
-    # 우선순위: 도메인 규칙 → 레벨 페르소나/형식 → 리스크 → (추천정책) → 유저 컨텍스트
     system_parts: List[str] = [
         base_system,
         level_inst,
@@ -520,12 +659,31 @@ def chatbot_chat(request: Request):
     except Exception:
         user_content = message
 
+    # 8) Persist user message
+    ChatLog.objects.create(session=session, role="user", content=user_content)
+
+    # 8.1) 세션 title이 비어있으면 "첫 질문 요약"으로 세팅
+    # - 기존 세션도 title이 비어있으면 첫 메시지 때 자동 세팅되도록
+    if not (session.title or "").strip():
+        session.title = _make_session_title(message)
+        # updated_at도 같이 터치 (세션 리스트 정렬에 반영)
+        session.updated_at = timezone.now()
+        session.save(update_fields=["title", "updated_at"])
+
+    # 9) Build history from DB (last N for LLM cost control)
+    recent_logs = (
+        ChatLog.objects.filter(session=session)
+        .order_by("-created_at", "-id")[:CHAT_CONTEXT_MESSAGES]
+    )
+    recent_logs = list(recent_logs)[::-1]  # chronological
+
     msgs: List[ChatMessage] = []
     if system_prompt:
         msgs.append(ChatMessage(role="system", content=system_prompt))
 
-    msgs.extend(_safe_history(history))
-    msgs.append(ChatMessage(role="user", content=user_content))
+    for log in recent_logs:
+        if log.role in ("user", "assistant") and log.content:
+            msgs.append(ChatMessage(role=log.role, content=log.content))
 
     client = get_gemini_client()
     try:
@@ -533,7 +691,21 @@ def chatbot_chat(request: Request):
     except Exception as e:
         return Response({"detail": f"Chat failed: {str(e)}"}, status=502)
 
-    resp: Dict[str, Any] = {"answer": answer}
+    # 10) Persist assistant response (너무 길면 서버 저장용으로만 컷)
+    ChatLog.objects.create(
+        session=session,
+        role="assistant",
+        content=answer[: CHAT_MAX_MESSAGE_CHARS * 5],
+    )
+
+    # Touch session + template 반영
+    # NOTE: QuerySet.update에는 FK 인스턴스 대신 *_id 사용이 안전
+    ChatSession.objects.filter(id=session.id).update(
+        updated_at=timezone.now(),
+        template_id=(template.id if template is not None else None),
+    )
+
+    resp: Dict[str, Any] = {"answer": answer, "session_id": session.id}
     if template is not None:
         resp["template"] = {"id": template.id, "key": template.key}
     else:

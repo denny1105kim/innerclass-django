@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 
@@ -79,3 +80,53 @@ class PromptTemplate(models.Model):
 
     def __str__(self) -> str:
         return f"{self.key} ({'active' if self.is_active else 'inactive'})"
+
+
+class ChatSession(models.Model):
+    """User-scoped chat session (conversation thread)."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="chat_sessions",
+        db_index=True,
+    )
+    title = models.CharField(max_length=120, blank=True, default="")
+    template = models.ForeignKey(
+        "PromptTemplate",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="chat_sessions",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
+
+    class Meta:
+        ordering = ["-updated_at", "-id"]
+
+    def __str__(self) -> str:
+        return f"ChatSession#{self.id} ({self.user_id})"
+
+
+class ChatMessage(models.Model):
+    """Single message in a chat session."""
+
+    session = models.ForeignKey(
+        ChatSession,
+        on_delete=models.CASCADE,
+        related_name="messages",
+        db_index=True,
+    )
+    role = models.CharField(max_length=20)  # "user" | "assistant"
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        indexes = [
+            models.Index(fields=["session", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"ChatMessage#{self.id} {self.role}"

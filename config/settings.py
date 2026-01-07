@@ -50,13 +50,16 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "main",
-
     "corsheaders",
     "rest_framework",
     "rest_framework_simplejwt",
     "django.contrib.postgres",
-    "auth_app",
+    "main",
+    "chatbot",
+    "markets",
+    "news",
+    "reco",
+    "accounts",
 ]
 
 MIDDLEWARE = [
@@ -141,14 +144,16 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 
-
+CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",    # 로컬 개발용 React 주소
+    "http://127.0.0.1:5173",
     "https://swjbs.com",        # 배포용 주소
 ]
 
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:5173",
+    "http://127.0.0.1:5173",
     "https://swjbs.com", 
 ]
 
@@ -169,3 +174,5 @@ SIMPLE_JWT = {
     'ALGORITHM': 'HS256',
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")

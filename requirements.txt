@@ -19,4 +19,10 @@ pandas==2.2.3
 yfinance==0.2.54
 pykrx==1.0.51
 setuptools<81
-google-genai
+google-genai==0.3.0
+openai==1.57.0
+pgvector==0.3.6
+beautifulsoup4==4.12.3
+finance-datareader
+exchange-calendars
+lxml

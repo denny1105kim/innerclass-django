@@ -17,12 +17,15 @@ Including another URLconf
 
 from django.contrib import admin
 from django.urls import path, include
-from auth_app.views import OnboardingView, UserWithdrawalView
+from accounts.views import OnboardingView, UserWithdrawalView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/user/onboarding/", OnboardingView.as_view(), name="user_onboarding"),
     path("api/user/withdraw/", UserWithdrawalView.as_view(), name="user_withdraw"),
-    path("auth/", include('auth_app.urls')),
-    path("", include("main.urls")),
+    path("auth/", include('accounts.urls')),
+    path("api/markets/", include("markets.urls")),
+    path("api/news/", include("news.urls")),
+    path("api/chatbot/", include("chatbot.urls")),
+    path("api/recommend/", include("reco.urls")),
 ]

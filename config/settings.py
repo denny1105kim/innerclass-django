@@ -57,6 +57,7 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt",
     "django.contrib.postgres",
     "auth_app",
+    "news_app",
 ]
 
 MIDDLEWARE = [
@@ -169,3 +170,5 @@ SIMPLE_JWT = {
     'ALGORITHM': 'HS256',
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")

@@ -21,6 +21,7 @@ from auth_app.views import OnboardingView, UserWithdrawalView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("api/news/", include('news_app.urls')),
     path("api/user/onboarding/", OnboardingView.as_view(), name="user_onboarding"),
     path("api/user/withdraw/", UserWithdrawalView.as_view(), name="user_withdraw"),
     path("auth/", include('auth_app.urls')),

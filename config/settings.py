@@ -176,5 +176,6 @@ SIMPLE_JWT = {
 }
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
 _raw = os.getenv("NEWSAPI_KEYS", "")
 NEWSAPI_KEYS = [k.strip() for k in _raw.split(",") if k.strip()]

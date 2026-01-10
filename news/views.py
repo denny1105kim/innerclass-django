@@ -147,23 +147,74 @@ class NewsView(APIView):
         else:
             final_result = unique_result[:15]
 
+
+
+
         # ------------------------------------------------------------
         # 9) Response 데이터 구성
         # ------------------------------------------------------------
-        news_data = [
-            {
+        news_data = []
+        for n in final_result:
+            tags = []
+            
+            # 1. 태그: 내 보유 종목 (최우선)
+            if n in my_stock_news:
+                tags.append("내 보유 종목")
+            
+            # 2. 태그: AI 분석 키워드 (있으면 2개까지)
+            if n.analysis and isinstance(n.analysis, dict) and 'keywords' in n.analysis:
+                keywords = n.analysis.get('keywords', [])
+                if keywords:
+                    tags.extend(keywords[:2])
+            
+            # 3. 태그: 키워드가 없을 경우를 대비한 Fallback (섹터/티커)
+            if len(tags) == 0:
+                if n.sector:
+                    tags.append(n.sector)
+                if n.ticker:
+                    tags.append(n.ticker)
+                # 그래도 없으면 기본값
+                if not tags:
+                    tags.append("뉴스")
+
+            # --------------------------------------------------------
+            # [NEW] 사용자 투자 지식 수준에 따른 맞춤형 요약 선택
+            # --------------------------------------------------------
+            # 기본값: 요약문(summary) 사용
+            display_summary = n.summary
+            
+            # 1. 사용자 레벨 가져오기 (비로그인/프로필 없음 -> Lv.1)
+            user_level = 1
+            if request.user.is_authenticated:
+                try:
+                    # related_name="profile" 가정
+                    if hasattr(request.user, 'profile'):
+                        user_level = request.user.profile.knowledge_level
+                        # 범위 보정 (1~5)
+                        if user_level < 1: user_level = 1
+                        if user_level > 5: user_level = 5
+                except:
+                    user_level = 1
+            
+            # 2. 분석 데이터에서 해당 레벨 요약 꺼내기
+            if n.analysis and isinstance(n.analysis, dict):
+                versions = n.analysis.get('summary_versions', {})
+                key = f"lv{user_level}" # lv1, lv2, ...
+                if key in versions:
+                    display_summary = versions[key]
+
+            news_data.append({
                 "id": n.id,
                 "title": n.title,
-                "summary": n.summary,
+                "summary": display_summary, # 맞춤형 요약으로 덮어씀
                 "ticker": n.ticker,
-                "tag": "내 보유 종목" if n in my_stock_news else "AI 추천",
+                "tags": tags,
                 "published_at": n.published_at,
                 "url": n.url,
                 "image_url": n.image_url,
                 "market": n.market,
-            }
-            for n in final_result
-        ]
+            })
+
 
         # ------------------------------------------------------------
         # 10) 추천 키워드 생성 (최대 4개)
@@ -203,28 +254,75 @@ class NewsSummaryView(APIView):
         except NewsArticle.DoesNotExist:
             return Response({"error": "뉴스를 찾을 수 없습니다."}, status=404)
 
-        # 1. DB에 저장된 분석 결과가 있는지 확인
-        if article.analysis:
-            return Response(
-                {
-                    "success": True,
-                    "article_id": article.id,
-                    "article_title": article.title,
-                    "analysis": article.analysis,
-                }
-            )
+        # 1. 분석 데이터 확보 (DB or 생성)
+        analysis_data = article.analysis
+        if not analysis_data:
+            analysis_data = analyze_news(article, save_to_db=True)
+            
+        if not analysis_data:
+             return Response({"error": "분석에 실패했습니다."}, status=500)
 
-        # 2. 없으면 서비스 호출하여 생성 및 저장
-        result = analyze_news(article, save_to_db=True)
+        # 2. 사용자 레벨에 따라 응답 데이터 커스터마이징 (메모리상에서만 변경)
+        # 중요: DB에 있는 JSON을 직접 수정하지 않도록 deep copy 혹은 shallow copy 사용
+        # 여기서는 1depth copy로 충분할 수 있으나, nested structures가 있으므로 주의.
+        # 단순히 필드 교체만 하므로 copy()로 충분.
+        final_analysis = analysis_data.copy()
 
-        if result:
-            return Response(
-                {
-                    "success": True,
-                    "article_id": article.id,
-                    "article_title": article.title,
-                    "analysis": result,
-                }
-            )
-        else:
-            return Response({"error": "분석에 실패했습니다."}, status=500)
+        user_level = 1
+        if request.user.is_authenticated:
+            try:
+                if hasattr(request.user, 'profile'):
+                    user_level = request.user.profile.knowledge_level
+                    # 범위 보정 (1~5)
+                    if user_level < 1: user_level = 1
+                    if user_level > 5: user_level = 5
+            except:
+                pass
+        
+        # 3. 새로운 다중 레벨 구조(level_content)가 있는 경우, 해당 레벨 데이터로 덮어쓰기
+        if 'level_content' in final_analysis:
+            level_key = f"lv{user_level}"
+            level_data = final_analysis['level_content'].get(level_key)
+            
+            if level_data:
+                # level_data 내부의 키(summary, bullet_points 등)를 상위로 끌어올림 (Flatten)
+                final_analysis.update(level_data)
+                
+                # 프론트엔드 호환성을 위해 'investment_action'이 'action_guide'로 되어있을 경우 매핑
+                if 'action_guide' in level_data and 'investment_action' not in level_data:
+                     # action_guide가 문자열이면 리스트로 변환 (프론트가 리스트 기대 시)
+                     # 기존 프롬프트에서는 action_guide가 문자열이거나 리스트일 수 있음.
+                     # NewsDetailModal.tsx에서는 investment_action.map(...)을 사용하므로 리스트여야 함.
+                     ag = level_data['action_guide']
+                     if isinstance(ag, str):
+                         final_analysis['investment_action'] = [ag]
+                     else:
+                         final_analysis['investment_action'] = ag
+
+        # [Safety Patch] strategy_guide가 없는 경우 (프론트엔드 에러 방지)
+        # 이전 버전의 데이터나, 생성 중 누락된 경우를 대비하여 기본값 주입
+        if 'strategy_guide' not in final_analysis or not final_analysis['strategy_guide']:
+            final_analysis['strategy_guide'] = {
+                "short_term": "분석 데이터가 충분하지 않습니다.",
+                "long_term": "추후 업데이트 될 예정입니다."
+            }
+
+        # 4. (구버전 호환) 전문가(Lv.4 이상)인 경우 전문가용 필드로 교체 (level_content가 없는 구버전 데이터 대비)
+        elif user_level >= 4:
+            if 'bullet_points_expert' in final_analysis:
+                final_analysis['bullet_points'] = final_analysis['bullet_points_expert']
+            if 'what_is_this_expert' in final_analysis:
+                final_analysis['what_is_this'] = final_analysis['what_is_this_expert']
+            if 'why_important_expert' in final_analysis:
+                final_analysis['why_important'] = final_analysis['why_important_expert']
+            if 'stock_impact_expert' in final_analysis:
+                final_analysis['stock_impact'] = final_analysis['stock_impact_expert']
+
+        return Response(
+            {
+                "success": True,
+                "article_id": article.id,
+                "article_title": article.title,
+                "analysis": final_analysis,
+            }
+        )

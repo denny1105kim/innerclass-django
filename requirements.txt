@@ -16,7 +16,7 @@ sqlparse==0.5.5
 urllib3==2.6.2
 whitenoise==6.11.0
 pandas==2.2.3
-yfinance==0.2.54
+yfinance==0.2.58
 pykrx==1.0.51
 setuptools<81
 google-genai==0.3.0
@@ -26,3 +26,7 @@ beautifulsoup4==4.12.3
 finance-datareader
 exchange-calendars
 lxml
+sentence-transformers==3.3.1
+torch==2.5.1+cpu
+redis
+requests-cache

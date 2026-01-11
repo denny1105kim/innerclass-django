@@ -179,3 +179,40 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
 _raw = os.getenv("NEWSAPI_KEYS", "")
 NEWSAPI_KEYS = [k.strip() for k in _raw.split(",") if k.strip()]
+
+def _get_int_env(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+#EMBEDING_LOCAL_LLM
+USE_LOCAL_EMBEDDING = os.getenv("USE_LOCAL_EMBEDDING", "1") == "1"
+LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "intfloat/multilingual-e5-base")
+LOCAL_EMBED_DEVICE = os.getenv("LOCAL_EMBED_DEVICE", "cpu")
+LOCAL_EMBED_BATCH_SIZE = _get_int_env("LOCAL_EMBED_BATCH_SIZE", 16)
+LOCAL_EMBED_NORMALIZE = os.getenv("LOCAL_EMBED_NORMALIZE", "1") == "1"
+LOCAL_EMBED_DIM = _get_int_env("LOCAL_EMBED_DIM", 768)
+
+NEWS_WORKER_TOKEN = os.getenv("DJANGO_TOKEN", "")
+
+# NASDAQ tickers cache
+NASDAQ_UNIVERSE_TTL_SECONDS = 24 * 60 * 60
+
+# yfinance hardening
+YF_MAX_RETRIES = 6
+YF_BACKOFF_BASE_SEC = 10.0
+YF_DOWNLOAD_CHUNK_SIZE = 3
+YF_CHUNK_SLEEP_SEC = 10
+
+# requests-cache expire (seconds)
+YF_HTTP_CACHE_EXPIRE_SEC = 6 * 60 * 60
+
+# market cap은 기본 OFF 권장 (ON이면 rate limit 더 쉽게 걸림)
+NASDAQ_ENABLE_MARKET_CAP = False
+
+NEWS_ALL_TARGET_KR = 8
+NEWS_ALL_TARGET_INTL = 7

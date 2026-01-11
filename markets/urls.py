@@ -1,8 +1,8 @@
-# apps/markets/urls.py
 from django.urls import path
 
 from . import views
 
 urlpatterns = [
-    path("today/", views.today_market, name="today_market"),
+    path("today/", views.today_rankings, name="today_rankings"),
+    path("symbols/suggest/", views.symbol_suggest, name="symbol-suggest"),
 ]

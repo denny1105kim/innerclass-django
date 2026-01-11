@@ -3,59 +3,48 @@ from __future__ import annotations
 from django.db import models
 
 
-class Market(models.TextChoices):
-    KR = "KR", "Korea"
-    US = "US", "United States"
+class MarketChoices(models.TextChoices):
+    KOSPI = "KOSPI", "KOSPI"
+    KOSDAQ = "KOSDAQ", "KOSDAQ"
+    NASDAQ = "NASDAQ", "NASDAQ"
 
 
-class Stock(models.Model):
-    market = models.CharField(max_length=2, choices=Market.choices, db_index=True)
-    symbol = models.CharField(max_length=32, db_index=True)  # KR: "005930", US: "AAPL"
-    name = models.CharField(max_length=128)
+class RankingTypeChoices(models.TextChoices):
+    MARKET_CAP = "MARKET_CAP", "시가총액"
+    RISE = "RISE", "상승률"
+    FALL = "FALL", "하락률"
 
-    currency = models.CharField(max_length=8, default="KRW")  # KRW / USD
-    exchange = models.CharField(max_length=32, blank=True, default="")  # KOSPI/KOSDAQ/NASDAQ/NYSE 등
-    is_active = models.BooleanField(default=True)
+
+class DailyRankingSnapshot(models.Model):
+    """
+    일별 랭킹 스냅샷을 저장.
+
+    - 원본 row를 payload(JSON)에 그대로 저장하여 필드 변경에도 방어
+    - 자주 쓰는 필드(symbol_code, name, trade_price, change_rate)는 별도 컬럼으로 중복 저장
+    """
+
+    asof_date = models.DateField(db_index=True)
+    market = models.CharField(max_length=10, choices=MarketChoices.choices, db_index=True)
+    ranking_type = models.CharField(max_length=20, choices=RankingTypeChoices.choices, db_index=True)
+    rank = models.PositiveIntegerField(db_index=True)
+
+    symbol_code = models.CharField(max_length=20, db_index=True)  # e.g., "A005930" or "AAPL"
+    name = models.CharField(max_length=200)
+
+    trade_price = models.FloatField(null=True, blank=True)
+    change_rate = models.FloatField(null=True, blank=True)
+
+    payload = models.JSONField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = [("market", "symbol")]
+        unique_together = ("asof_date", "market", "ranking_type", "rank")
         indexes = [
-            models.Index(fields=["market", "exchange"]),
-            models.Index(fields=["exchange", "symbol"]),
+            models.Index(fields=["asof_date", "market", "ranking_type", "rank"]),
+            models.Index(fields=["asof_date", "market", "ranking_type"]),
+            models.Index(fields=["symbol_code", "asof_date"]),
         ]
 
     def __str__(self) -> str:
-        return f"{self.market}:{self.symbol} {self.name}"
-
-
-class DailyStockSnapshot(models.Model):
-    stock = models.ForeignKey(Stock, on_delete=models.CASCADE, related_name="snapshots")
-    date = models.DateField(db_index=True)
-
-    # intraday/eod metrics (프로젝트 단순화)
-    open = models.DecimalField(max_digits=20, decimal_places=4, null=True)
-    close = models.DecimalField(max_digits=20, decimal_places=4, null=True)
-
-    prev_close = models.DecimalField(max_digits=20, decimal_places=4, null=True)
-
-    # intraday % (UI 호환: change_pct에도 동일 저장)
-    change_pct = models.DecimalField(max_digits=10, decimal_places=4, null=True)
-    intraday_pct = models.DecimalField(max_digits=10, decimal_places=4, null=True)
-
-    market_cap = models.BigIntegerField(null=True)
-    volume = models.BigIntegerField(null=True)
-
-    # reserved
-    volatility_20d = models.DecimalField(max_digits=10, decimal_places=4, null=True)
-
-    class Meta:
-        unique_together = [("stock", "date")]
-        indexes = [
-            models.Index(fields=["date", "stock"]),
-            models.Index(fields=["date", "market_cap"]),
-            models.Index(fields=["date", "intraday_pct"]),
-            models.Index(fields=["date", "change_pct"]),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.stock.symbol} {self.date}"
+        return f"{self.asof_date} {self.market} {self.ranking_type} #{self.rank} {self.symbol_code} {self.name}"

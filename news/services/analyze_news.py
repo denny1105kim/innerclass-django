@@ -1,7 +1,8 @@
+# analyze_news.py
 import openai
 from django.conf import settings
 import json
-from .models import NewsArticle
+from ..models import NewsArticle
 
 def analyze_news(article: NewsArticle, save_to_db=True):
     """

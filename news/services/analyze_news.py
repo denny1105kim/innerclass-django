@@ -1,4 +1,3 @@
-# analyze_news.py
 import openai
 from django.conf import settings
 import json

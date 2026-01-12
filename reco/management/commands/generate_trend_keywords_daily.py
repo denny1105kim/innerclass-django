@@ -1,4 +1,3 @@
-# apps/reco/management/commands/generate_trend_keywords_daily.py
 from __future__ import annotations
 
 import json
@@ -23,31 +22,15 @@ from main.services.gemini_client import get_gemini_client, ChatMessage
 # Config
 # =========================================================
 KEYWORD_LIMIT = 3
-
-# ✅ 최종 저장 개수(키워드별)
 NEWS_LIMIT = 15
-
-# ✅ 후보 풀: 키워드별로 최대 100개까지 모은 후 선별
 CANDIDATE_POOL_LIMIT = 100
-
-# ✅ LLM에서 한 번에 요청할 뉴스 개수
 BATCH_SIZE = 25
-
-# ✅ 후보가 부족하면 추가 검색 반복 횟수
 MAX_REFILL_ATTEMPTS = 10
-
 REQUEST_TIMEOUT = 8.0
 KST = ZoneInfo("Asia/Seoul")
-
-# ✅ “과거 뉴스 절대 안됨”
 MAX_AGE_DAYS = 4
-
-# ✅ 본문 저장 최대 길이
 CONTENT_MAX_CHARS = 6000
-
-# ✅ 기사 본문 최소 길이(너무 짧으면 목록/메인/중계일 확률 높음)
 MIN_ARTICLE_TEXT_CHARS = 180
-
 BLOCKED_DOMAINS = {
     "example.com",
     "vertexaisearch.cloud.google.com",
@@ -55,7 +38,6 @@ BLOCKED_DOMAINS = {
     # 검색/중계 류(필요 시 확장)
     "news.google.com",
 }
-
 BLOCKED_HOST_KEYWORDS = (
     "vertexaisearch",
     "example.com",

@@ -1,4 +1,3 @@
-# apps/markets/services/daily_rank_sync.py
 from __future__ import annotations
 
 from datetime import date
@@ -53,7 +52,6 @@ def _normalize_change_rate(*, market: str, row: Dict[str, Any]) -> Optional[floa
             raw = raw * 100.0
         return raw
 
-    # NASDAQ: 그대로(부호 유지)
     return raw
 
 
@@ -97,7 +95,7 @@ def _sort_rows(*, ranking_type: str, rows: List[Dict[str, Any]]) -> List[Dict[st
 
 def _filter_rows_for_type(*, market: str, ranking_type: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    ✅ NASDAQ는 rise/fall을 sign 기준으로 필터링한다.
+    NASDAQ는 rise/fall을 sign 기준으로 필터링한다.
     (KR은 Daum API가 이미 RISE/FALL 분리된 데이터라 그냥 통과)
     """
     if market != MarketChoices.NASDAQ:
@@ -128,7 +126,7 @@ def replace_ranking(*, asof: date, market: str, ranking_type: str, rows: Iterabl
     for r in src:
         r["_norm_cr"] = _normalize_change_rate(market=market, row=r)
 
-    # ✅ NASDAQ rise/fall은 sign으로 필터
+    # NASDAQ rise/fall은 sign으로 필터
     src = _filter_rows_for_type(market=market, ranking_type=ranking_type, rows=src)
 
     # 정렬

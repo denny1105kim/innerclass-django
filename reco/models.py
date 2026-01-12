@@ -1,4 +1,3 @@
-# apps/reco/models.py
 from __future__ import annotations
 
 from django.db import models
@@ -53,12 +52,16 @@ class TrendKeywordNews(models.Model):
 
     needs_image_gen = models.BooleanField(default=False, db_index=True)
 
+    analysis = models.JSONField(null=True, blank=True)
+
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         indexes = [
             models.Index(fields=["trend", "created_at"]),
             models.Index(fields=["needs_image_gen", "created_at"]),
+            models.Index(fields=["updated_at"]),
         ]
 
     def __str__(self) -> str:

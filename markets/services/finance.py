@@ -1,4 +1,3 @@
-# apps/markets/services/finance.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -229,7 +228,7 @@ class DaumFinanceClient:
         self, market: str, change_type: str, page: int = 1, per_page: int = 200
     ) -> TrendResult:
         """
-        ✅ 핵심 수정:
+        핵심 수정:
         - RISE: order=desc (큰 상승률이 1위)
         - FALL: order=asc  (가장 음수인 하락률이 1위)
         - FALL changeRate가 양수로 올 때가 있어 서버에서 음수로 강제(-abs)
@@ -239,7 +238,7 @@ class DaumFinanceClient:
 
         path = "/api/trend/price_performance"
 
-        # ✅ Daum 'fall_stocks' 화면과 동일하게: FALL은 오름차순
+        #  Daum 'fall_stocks' 화면과 동일하게: FALL은 오름차순
         order = "desc" if change_type == "RISE" else "asc"
 
         params = {
@@ -257,7 +256,7 @@ class DaumFinanceClient:
         raw = self._get_json(path, params, referer=referer)
 
         rows = raw.get("data", []) or []
-        # ✅ changeRate 부호 일관화 (FALL은 음수)
+        #  changeRate 부호 일관화 (FALL은 음수)
         rows = _ensure_pct_signed_for_fall(change_type, rows)
 
         return TrendResult(
@@ -578,7 +577,7 @@ class SlickChartsNasdaq100Client:
         merged = self.fetch_merged_once()
         rows = merged["rows"]
 
-        # ✅ RISE는 +%만
+        #  RISE는 +%만
         only_pos = []
         for r in rows:
             cr = r.get("changeRate")
@@ -608,7 +607,7 @@ class SlickChartsNasdaq100Client:
         merged = self.fetch_merged_once()
         rows = merged["rows"]
 
-        # ✅ FALL은 -%만
+        #  FALL은 -%만
         only_neg = []
         for r in rows:
             cr = r.get("changeRate")

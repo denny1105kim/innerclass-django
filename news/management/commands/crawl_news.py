@@ -1,4 +1,3 @@
-# django/news/management/commands/crawl_news.py
 from __future__ import annotations
 
 import re
@@ -72,7 +71,7 @@ class Command(BaseCommand):
     MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB
 
     # ------------------------------------------------------
-    # ✅ URL / Title filtering 강화 (메인/섹션/메뉴 링크 차단)
+    # URL / Title filtering 강화 (메인/섹션/메뉴 링크 차단)
     # ------------------------------------------------------
     ARTICLE_DATE_RE = re.compile(r"/20\d{2}/\d{2}/\d{2}/")
     ARTICLE_HTMLDIR_RE = re.compile(r"/site/data/html_dir/")
@@ -154,6 +153,7 @@ class Command(BaseCommand):
         "special edition",
         "special",
         "edition",
+        "Desk pick",
     )
 
     MENU_TITLE_SHORT_RE = re.compile(r"^(국내|해외|경제|산업|증권|정치|사회|국제|문화|스포츠|연예|IT|테크)$")
@@ -413,7 +413,7 @@ class Command(BaseCommand):
         return False
 
     # -------------------------------
-    # ✅ “메뉴/섹션 링크” 판별(강화)
+    #  “메뉴/섹션 링크” 판별(강화)
     # -------------------------------
     def _looks_like_menu_or_section_title(self, title: str) -> bool:
         t = (title or "").strip()

@@ -1,4 +1,3 @@
-# apps/chatbot/views.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -7,6 +6,7 @@ from datetime import timedelta
 import requests
 from django.conf import settings
 from django.core.paginator import EmptyPage, Paginator
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -15,12 +15,14 @@ from rest_framework.response import Response
 
 from main.services.gemini_client import ChatMessage as LlmMessage, get_gemini_client
 
+from news.models import NewsArticle
+from markets.models import DailyRankingSnapshot
+
 from .models import (
     PromptTemplate,
     ChatSession,
     ChatMessage as ChatLog,
 )
-
 
 # -----------------------------
 # Chat persistence settings
@@ -33,6 +35,9 @@ CHAT_PAGE_SIZE_DEFAULT = 50
 CHAT_PAGE_SIZE_MAX = 100
 
 
+# -----------------------------
+# Cleanup helpers
+# -----------------------------
 def _chat_cleanup_retention() -> None:
     cutoff = timezone.now() - timedelta(days=CHAT_RETENTION_DAYS)
     ChatLog.objects.filter(created_at__lt=cutoff).delete()
@@ -66,6 +71,18 @@ def _serialize_chatlog(m: ChatLog) -> Dict[str, Any]:
 
 
 # -----------------------------
+# Tone & style (영한 GPT)
+# -----------------------------
+YOUNG_TONE_STYLE = """
+[Answer Style 😄]
+- 보고서 말투 ❌, 자연스러운 대화체 👍
+- 적절한 이모지 사용 (📈🔥⚠️💡)
+- 결론 먼저 → 이유 → 리스크 순서
+- 수익 보장/확정 표현 금지
+""".strip()
+
+
+# -----------------------------
 # Prompt helpers
 # -----------------------------
 FALLBACK_DOMAIN_GUARDRAILS = """
@@ -83,6 +100,9 @@ def _get_default_template() -> Optional[PromptTemplate]:
     return PromptTemplate.objects.filter(is_active=True).order_by("-updated_at", "-id").first()
 
 
+# -----------------------------
+# Profile 기반 Prompt (복구)
+# -----------------------------
 def _risk_profile_text(code: str) -> str:
     return {
         "A": "공격형(고위험·고수익 선호, 성장/모멘텀 중심, 손절/변동성 관리 중요)",
@@ -132,7 +152,7 @@ def _level_system_instruction(level: int) -> str:
         return """
 [System Instruction - Level 3 (일반/중급)]
 - 합쇼체, 팩트 중심.
-- [추천] 먼저, [근거], [체크포인트/리스크]
+- 결론/추천 먼저, 그 다음 근거, 마지막 리스크/체크포인트.
 """.strip()
 
     if level == 4:
@@ -155,6 +175,23 @@ def _risk_overrides(risk: str) -> str:
     if risk == "C":
         return "[Risk Overlay - 안정형] 방어/현금흐름 관점. 수익보장 금지."
     return "[Risk Overlay - 중립형] 분산/균형 관점. 수익보장 금지."
+
+
+def _is_recommendation_intent(message: str) -> bool:
+    m = (message or "").strip().lower()
+    keys = ["추천", "추천주", "종목 추천", "오늘 추천", "오늘의 추천", "top pick", "pick", "매수", "사볼", "담을"]
+    return any(k.lower() in m for k in keys)
+
+
+def _recommendation_policy(level: int) -> str:
+    level = _clamp_level(level)
+    if level <= 2:
+        return "[Recommendation Policy] 추천이면 종목 2~3개 먼저 + 이유/체크포인트 + 리스크 1줄."
+    if level == 3:
+        return "[Recommendation Policy] 결론/추천 먼저, 종목별 근거/체크포인트/리스크 포함."
+    if level == 4:
+        return "[Recommendation Policy] Picks 먼저, Rationale, Risk/Invalidation."
+    return "[Recommendation Policy] Picks/Thesis/Triggers/Risk/Action."
 
 
 def _build_user_context_from_payload(profile_data: Dict[str, Any]) -> str:
@@ -187,6 +224,9 @@ def _build_user_context_from_payload(profile_data: Dict[str, Any]) -> str:
 
 
 def _try_get_profile_via_model(request: Request) -> Optional[Dict[str, Any]]:
+    """
+    accounts 앱이 없을 수도 있으니 안전하게 import.
+    """
     try:
         from accounts.models import UserProfile  # type: ignore
     except Exception:
@@ -206,6 +246,10 @@ def _try_get_profile_via_model(request: Request) -> Optional[Dict[str, Any]]:
 
 
 def _try_get_profile_via_http(request: Request) -> Optional[Dict[str, Any]]:
+    """
+    내부 API로 프로필을 가져오는 fallback.
+    - 401/403 등 실패해도 서비스가 죽지 않도록 None 반환.
+    """
     auth_header = request.headers.get("Authorization") or request.META.get("HTTP_AUTHORIZATION")
     if not auth_header:
         return None
@@ -228,25 +272,51 @@ def _get_user_profile_data(request: Request) -> Optional[Dict[str, Any]]:
     return d if d else _try_get_profile_via_http(request)
 
 
-def _is_recommendation_intent(message: str) -> bool:
-    m = (message or "").strip().lower()
-    keys = ["추천", "추천주", "종목 추천", "오늘 추천", "오늘의 추천", "top pick", "pick", "매수", "사볼", "담을"]
-    return any(k.lower() in m for k in keys)
+# -----------------------------
+# Internal DB Context (1차)
+# -----------------------------
+def _build_internal_context(query: str, limit: int = 5) -> str:
+    blocks: List[str] = []
 
+    q = (query or "").strip()
+    if not q:
+        return ""
 
-def _recommendation_policy(level: int) -> str:
-    level = _clamp_level(level)
-    if level <= 2:
-        return "[Recommendation Policy] 추천이면 종목 2~3개 먼저 + 이유/체크포인트 + 리스크 1줄."
-    if level == 3:
-        return "[Recommendation Policy] [추천] 먼저, 종목별 근거/체크포인트/리스크 포함."
-    if level == 4:
-        return "[Recommendation Policy] Picks 먼저, Rationale, Risk/Invalidation."
-    return "[Recommendation Policy] Picks/Thesis/Triggers/Risk/Action."
+    # 1) 뉴스 텍스트 검색(간단)
+    news_qs = (
+        NewsArticle.objects.filter(
+            Q(title__icontains=q) | Q(content__icontains=q) | Q(summary__icontains=q)
+        )
+        .order_by("-published_at")[:limit]
+    )
+
+    for n in news_qs:
+        summary = (n.summary or (n.content[:220] if n.content else "")).strip()
+        if summary:
+            blocks.append(f"📰 {n.title}\n- {summary}")
+
+    # 2) 랭킹 스냅샷 검색(종목/심볼)
+    stock_qs = (
+        DailyRankingSnapshot.objects.filter(
+            Q(name__icontains=q) | Q(symbol_code__icontains=q)
+        )
+        .order_by("-asof_date", "-id")[:limit]
+    )
+
+    for s in stock_qs:
+        blocks.append(
+            f"📈 {s.name} ({s.symbol_code})\n"
+            f"- 기준일: {s.asof_date}\n"
+            f"- 시장: {s.market} / 랭킹타입: {s.ranking_type} / 순위: {s.rank}\n"
+            f"- 현재가: {s.trade_price}\n"
+            f"- 등락률: {s.change_rate}"
+        )
+
+    return "\n\n".join([b for b in blocks if b.strip()]).strip()
 
 
 # -----------------------------
-# Endpoints
+# Endpoints (urls.py 호환 필수)
 # -----------------------------
 @api_view(["GET"])
 @permission_classes([AllowAny])
@@ -298,6 +368,7 @@ def chatbot_session_detail(request: Request, session_id: int):
         page = int(request.query_params.get("page", 1))
     except Exception:
         page = 1
+
     try:
         page_size = int(request.query_params.get("page_size", CHAT_PAGE_SIZE_DEFAULT))
     except Exception:
@@ -342,17 +413,19 @@ def chatbot_session_detail(request: Request, session_id: int):
 def chatbot_chat(request: Request):
     _chat_cleanup_retention()
 
+    message = (request.data.get("message") or "").strip()
+    session_id = request.data.get("session_id")
     template_id = request.data.get("template_id")
     template_key = request.data.get("template_key")
-    session_id = request.data.get("session_id")
-    message = (request.data.get("message") or "").strip()
 
     if not message:
         return Response({"detail": "message is required"}, status=400)
     if len(message) > CHAT_MAX_MESSAGE_CHARS:
         return Response({"detail": f"message is too long (max {CHAT_MAX_MESSAGE_CHARS})"}, status=400)
 
-    # template resolve
+    # -----------------------------
+    # Template resolve (복구: 기존 기능 유지)
+    # -----------------------------
     template: Optional[PromptTemplate] = None
     if template_id:
         try:
@@ -371,16 +444,37 @@ def chatbot_chat(request: Request):
     if not base_system:
         base_system = FALLBACK_DOMAIN_GUARDRAILS
 
-    # session resolve/create
+    try:
+        user_content = (user_prompt_template or "{message}").format(message=message)
+    except Exception:
+        user_content = message
+
+    # -----------------------------
+    # Session resolve/create
+    # -----------------------------
     if session_id:
         try:
             session = ChatSession.objects.get(id=int(session_id), user=request.user)
         except Exception:
             return Response({"detail": "Invalid session_id"}, status=400)
     else:
-        session = ChatSession.objects.create(user=request.user, template=template, title="")
+        session = ChatSession.objects.create(
+            user=request.user,
+            template=template,
+            title="",
+        )
 
-    # profile
+    # persist user
+    ChatLog.objects.create(session=session, role="user", content=user_content)
+
+    if not (session.title or "").strip():
+        session.title = _make_session_title(message)
+        session.updated_at = timezone.now()
+        session.save(update_fields=["title", "updated_at"])
+
+    # -----------------------------
+    # Profile 기반 프롬프트 구성 (복구)
+    # -----------------------------
     profile_data = _get_user_profile_data(request)
     risk = ""
     level = 3
@@ -394,41 +488,61 @@ def chatbot_chat(request: Request):
     risk_inst = _risk_overrides(risk) if risk else ""
     rec_inst = _recommendation_policy(level) if _is_recommendation_intent(message) else ""
 
-    system_prompt = "\n\n".join(
-        [p for p in [base_system, level_inst, risk_inst, rec_inst, user_context] if p.strip()]
-    ).strip()
+    # -----------------------------
+    # 1️⃣ 내부 DB 컨텍스트 우선 (기능 유지)
+    # -----------------------------
+    internal_context = _build_internal_context(message, limit=5)
 
-    try:
-        user_content = (user_prompt_template or "{message}").format(message=message)
-    except Exception:
-        user_content = message
+    # 내부 컨텍스트가 충분하면 검색 끔, 없으면 검색 켬 (기능 유지)
+    use_search = False
+    if not internal_context:
+        use_search = True
 
-    # persist user
-    ChatLog.objects.create(session=session, role="user", content=user_content)
+    # -----------------------------
+    # System prompt (기존 + 영한 톤 + 프로필 + 내부DB)
+    # -----------------------------
+    system_blocks: List[str] = [
+        base_system,          # template/system_prompt or fallback
+        YOUNG_TONE_STYLE,     # 영한 스타일
+        level_inst,           # 레벨별 스타일
+        risk_inst,            # 리스크 성향 overlay
+        rec_inst,             # 추천 정책
+        user_context,         # 유저 프로필 컨텍스트
+    ]
 
-    if not (session.title or "").strip():
-        session.title = _make_session_title(message)
-        session.updated_at = timezone.now()
-        session.save(update_fields=["title", "updated_at"])
+    if internal_context:
+        system_blocks.append(f"[Internal Knowledge Base 📚]\n{internal_context}")
+    else:
+        system_blocks.append("ℹ️ 내부 데이터가 부족해서 최신 정보는 검색 기반으로 보완해줘 🔎")
 
-    # history
+    system_prompt = "\n\n".join([b for b in system_blocks if (b or "").strip()]).strip()
+
+    # -----------------------------
+    # History
+    # -----------------------------
     recent_logs = list(
-        ChatLog.objects.filter(session=session).order_by("-created_at", "-id")[:CHAT_CONTEXT_MESSAGES]
+        ChatLog.objects.filter(session=session)
+        .order_by("-created_at", "-id")[:CHAT_CONTEXT_MESSAGES]
     )[::-1]
 
     llm_msgs: List[LlmMessage] = []
     if system_prompt:
         llm_msgs.append(LlmMessage(role="system", content=system_prompt))
+
     for log in recent_logs:
         if log.role in ("user", "assistant") and log.content:
             llm_msgs.append(LlmMessage(role=log.role, content=log.content))
 
+    # -----------------------------
+    # Gemini 호출
+    # -----------------------------
     client = get_gemini_client()
     try:
-        answer = client.chat(llm_msgs)
+        answer = client.chat(llm_msgs, use_search=use_search)
     except Exception as e:
         return Response({"detail": f"Chat failed: {str(e)}"}, status=502)
 
+    # Persist assistant
     ChatLog.objects.create(
         session=session,
         role="assistant",
@@ -440,13 +554,16 @@ def chatbot_chat(request: Request):
         template_id=(template.id if template else None),
     )
 
-    resp: Dict[str, Any] = {
-        "answer": answer,
-        "session_id": session.id,
-        "template": {"id": template.id, "key": template.key} if template else {"id": None, "key": "fallback"},
-        "profile_loaded": bool(profile_data),
-        "applied_level": level,
-        "applied_risk": risk or None,
-        "recommendation_mode": bool(rec_inst),
-    }
-    return Response(resp)
+    return Response(
+        {
+            "answer": answer,
+            "session_id": session.id,
+            "template": {"id": template.id, "key": template.key} if template else {"id": None, "key": "fallback"},
+            "profile_loaded": bool(profile_data),
+            "applied_level": level,
+            "applied_risk": risk or None,
+            "recommendation_mode": bool(rec_inst),
+            "used_internal_db": bool(internal_context),
+            "used_search": use_search,
+        }
+    )

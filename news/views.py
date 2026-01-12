@@ -15,6 +15,9 @@ from news.models import NewsArticle, NewsMarket, NewsSector
 from news.services.embedding_news import embed_query
 from news.services.analyze_news import analyze_news
 
+# (NEW) main analysis service (Lv3-style only, no level_content)
+from news.services.analyze_news_main import analyze_news_main
+
 
 # =========================================================
 # Market helpers
@@ -146,6 +149,22 @@ def _pick_display_summary(article: NewsArticle, user_level: int) -> str:
     return display_summary
 
 
+# (NEW) main용 summary pick (analyze_news_main 포맷)
+def _pick_main_display_summary(article: NewsArticle) -> str:
+    """
+    main 카드/메인 요약에 보여줄 summary:
+    1) article.analysis.analysis.summary (analyze_news_main 포맷)
+    2) article.summary
+    """
+    if article.analysis and isinstance(article.analysis, dict):
+        a = article.analysis.get("analysis")
+        if isinstance(a, dict):
+            s = a.get("summary")
+            if isinstance(s, str) and s.strip():
+                return s.strip()
+    return article.summary
+
+
 def _build_tags(article: NewsArticle, is_my_stock: bool) -> List[str]:
     tags: List[str] = []
     if is_my_stock:
@@ -207,15 +226,9 @@ class NewsSectorListView(APIView):
         market_filter = _parse_market_filter(request.query_params.get("market", "all"))
         qs = _base_queryset_by_market(market_filter)
 
-        # 실제 DB에 존재하는 sector 카운트
-        rows = (
-            qs.values("sector")
-            .annotate(count=Count("id"))
-            .order_by("-count")
-        )
+        rows = qs.values("sector").annotate(count=Count("id")).order_by("-count")
         count_map = {r["sector"]: int(r["count"]) for r in rows if r.get("sector")}
 
-        # TextChoices 순서대로 정렬해 내려주되, count=0은 제외
         items: List[Dict[str, Any]] = []
         for value, label in NewsSector.choices:
             c = count_map.get(value, 0)
@@ -223,9 +236,14 @@ class NewsSectorListView(APIView):
                 continue
             items.append({"sector": value, "label": label, "count": c})
 
-        # 안전장치: 그래도 비면 ETC라도 넣기
         if not items and NewsSector.ETC in count_map:
-            items.append({"sector": NewsSector.ETC, "label": NewsSector(NewsSector.ETC).label, "count": count_map[NewsSector.ETC]})
+            items.append(
+                {
+                    "sector": NewsSector.ETC,
+                    "label": NewsSector(NewsSector.ETC).label,
+                    "count": count_map[NewsSector.ETC],
+                }
+            )
 
         return Response({"market": market_filter, "items": items})
 
@@ -233,17 +251,6 @@ class NewsSectorListView(APIView):
 class NewsBySectorView(APIView):
     """
     GET /api/news/by-sector/?sector=FINANCE_HOLDING&market=all&limit=20
-
-    return:
-    {
-      "sector": "FINANCE_HOLDING",
-      "label": "금융 / 지주사",
-      "market": "all",
-      "news": [
-        {"id":1,"title":"...","related_name":"KB금융","ticker":"105560","published_at":"...","url":"...","market":"KR"},
-        ...
-      ]
-    }
     """
     permission_classes = [AllowAny]
 
@@ -262,7 +269,6 @@ class NewsBySectorView(APIView):
             sector = NewsSector.ETC
 
         qs = _base_queryset_by_market(market_filter).filter(sector=sector).order_by("-published_at")[:limit]
-
         label = NewsSector(sector).label if sector in valid else "기타"
 
         news = []
@@ -289,20 +295,7 @@ class NewsBySectorView(APIView):
 class WorkerResultIngestView(APIView):
     """
     POST /api/news/worker/result/
-
-    Expected payload:
-    {
-      "article_id": 123,
-      "sector": "SEMICONDUCTOR_AI" | ... | "ETC",
-      "confidence": 0.0 ~ 1.0,
-      "reason": "...",
-      "related_name": "...",
-      "related_symbol": "..."   # ticker/symbol
-    }
-
-    - settings.NEWS_WORKER_TOKEN 이 있으면 Authorization: Bearer <token> 필수
     """
-
     authentication_classes = []
     permission_classes = [AllowAny]
 
@@ -398,9 +391,6 @@ class NewsView(APIView):
         market_filter = _parse_market_filter(request.query_params.get("market", "all"))
         base_news = _base_queryset_by_market(market_filter)
 
-        # ------------------------------------------------------------
-        # 3) 보유 종목 뉴스
-        # ------------------------------------------------------------
         my_stock_news: List[NewsArticle] = []
         sectors = "경제"
         risk = "일반"
@@ -419,28 +409,22 @@ class NewsView(APIView):
                     kr_ticks, intl_ticks = _split_portfolio_by_market(pf_portfolio)
 
                     my_stock_kr = (
-                        NewsArticle.objects.filter(market=NewsMarket.KR, ticker__in=kr_ticks)
-                        .order_by("-published_at")[:1]
+                        NewsArticle.objects.filter(market=NewsMarket.KR, ticker__in=kr_ticks).order_by("-published_at")[:1]
                         if kr_ticks
                         else NewsArticle.objects.none()
                     )
                     my_stock_intl = (
-                        NewsArticle.objects.filter(market=NewsMarket.INTERNATIONAL, ticker__in=intl_ticks)
-                        .order_by("-published_at")[:1]
+                        NewsArticle.objects.filter(market=NewsMarket.INTERNATIONAL, ticker__in=intl_ticks).order_by("-published_at")[:1]
                         if intl_ticks
                         else NewsArticle.objects.none()
                     )
 
                     my_stock_news = list(my_stock_kr) + list(my_stock_intl)
                     my_stock_news = _dedupe_by_title(my_stock_news)
-
                 else:
                     my_stock_news_qs = base_news.filter(ticker__in=pf_portfolio).order_by("-published_at")[:2]
                     my_stock_news = list(my_stock_news_qs)
 
-        # ------------------------------------------------------------
-        # 4) query_text
-        # ------------------------------------------------------------
         keyword = (request.query_params.get("keyword") or "").strip()
         if keyword:
             my_stock_news = []
@@ -448,9 +432,6 @@ class NewsView(APIView):
         else:
             query_text = f"{sectors} 산업의 트렌드와 {risk} 투자 정보"
 
-        # ------------------------------------------------------------
-        # 5) query 임베딩
-        # ------------------------------------------------------------
         query_vec = embed_query(query_text)
         if not query_vec:
             qs = base_news.order_by("-published_at")[:15]
@@ -473,9 +454,6 @@ class NewsView(APIView):
                 )
             return Response({"news": news_data, "keywords": ["#경제", "#시장동향", "#투자"], "fallback": True})
 
-        # ------------------------------------------------------------
-        # 6) 유사도 후보군
-        # ------------------------------------------------------------
         exclude_ids = [n.id for n in my_stock_news]
         candidate_count = 200
         if keyword:
@@ -494,13 +472,12 @@ class NewsView(APIView):
             picked = candidates_list[:12] if market_filter == "all" else candidates_list[:4]
             picked = sorted(picked, key=lambda x: x.published_at, reverse=True)
         else:
-            picked = sorted(candidates_list, key=lambda x: x.published_at, reverse=True)[: (12 if market_filter == "all" else 4)]
+            picked = sorted(candidates_list, key=lambda x: x.published_at, reverse=True)[
+                : (12 if market_filter == "all" else 4)
+            ]
 
         combined = _dedupe_by_title(list(my_stock_news) + list(picked))
 
-        # ------------------------------------------------------------
-        # 8) ALL이면 자동 분배
-        # ------------------------------------------------------------
         target_total = 15
         target_kr = _get_int_setting("NEWS_ALL_TARGET_KR", 8)
         target_intl = _get_int_setting("NEWS_ALL_TARGET_INTL", 7)
@@ -515,9 +492,6 @@ class NewsView(APIView):
         else:
             final_result = combined[:target_total]
 
-        # ------------------------------------------------------------
-        # 9) Response
-        # ------------------------------------------------------------
         user_level = _get_user_level(request)
 
         my_stock_ids = {n.id for n in my_stock_news}
@@ -537,9 +511,6 @@ class NewsView(APIView):
                 }
             )
 
-        # ------------------------------------------------------------
-        # 10) 추천 키워드
-        # ------------------------------------------------------------
         if profile:
             keywords_list = ([f"#{s}" for s in profile.sectors] if getattr(profile, "sectors", None) else [])
             if getattr(profile, "portfolio", None):
@@ -557,7 +528,7 @@ class NewsView(APIView):
 
 
 # =========================================================
-# Detail summary view (LLM)
+# Detail summary view (LLM) - legacy multi-level
 # =========================================================
 class NewsSummaryView(APIView):
     """
@@ -610,5 +581,50 @@ class NewsSummaryView(APIView):
                 "article_id": article.id,
                 "article_title": article.title,
                 "analysis": final_analysis,
+            }
+        )
+
+
+# =========================================================
+# (NEW) Detail summary view (LLM) - main single-format (Lv3-style)
+# =========================================================
+class NewsMainSummaryView(APIView):
+    """
+    GET /api/news/<id>/main-summary/
+    - main 포맷(analyze_news_main) 분석이 없으면 생성 후 저장
+    - level_content 펼침 없이 main 포맷 그대로 반환
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, news_id: int):
+        try:
+            article = NewsArticle.objects.get(id=news_id)
+        except NewsArticle.DoesNotExist:
+            return Response({"error": "뉴스를 찾을 수 없습니다."}, status=404)
+
+        analysis_data = article.analysis
+
+        # main 포맷인지 판별: analysis.analysis.summary 존재 여부로 판단
+        is_main_format = False
+        if isinstance(analysis_data, dict):
+            a = analysis_data.get("analysis")
+            if isinstance(a, dict):
+                s = a.get("summary")
+                if isinstance(s, str) and s.strip():
+                    is_main_format = True
+
+        if not is_main_format:
+            analysis_data = analyze_news_main(article, save_to_db=True)
+
+        if not analysis_data or not isinstance(analysis_data, dict):
+            return Response({"error": "분석에 실패했습니다."}, status=500)
+
+        return Response(
+            {
+                "success": True,
+                "article_id": article.id,
+                "article_title": article.title,
+                "summary": _pick_main_display_summary(article),
+                "analysis": analysis_data,
             }
         )

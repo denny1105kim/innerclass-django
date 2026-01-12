@@ -352,24 +352,11 @@ class WorkerResultIngestView(APIView):
         except NewsArticle.DoesNotExist:
             return Response({"ok": False, "error": "Article not found"}, status=404)
 
-        analysis: Dict[str, Any] = {}
-        if isinstance(article.analysis, dict):
-            analysis.update(article.analysis)
-
-        analysis["worker_result"] = {
-            "sector": sector,
-            "confidence": confidence,
-            "reason": reason,
-            "related_name": related_name,
-            "related_symbol": related_symbol,
-        }
-
         article.sector = sector
         article.confidence = confidence
         article.related_name = related_name
         article.ticker = related_symbol
-        article.analysis = analysis
-        article.save(update_fields=["sector", "confidence", "related_name", "ticker", "analysis"])
+        article.save(update_fields=["sector", "confidence", "related_name", "ticker"])
 
         return Response({"ok": True, "article_id": article_id, "sector": sector, "confidence": confidence}, status=200)
 

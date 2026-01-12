@@ -66,7 +66,7 @@ def trend_keywords(request: Request):
         if with_news:
             row["news"] = [
                 {
-                    "id": n.id,  # ✅ trend 뉴스도 id 내려줌(모달 분석 호출 가능)
+                    "id": n.id,  #
                     "title": n.title,
                     "summary": n.summary,
                     "link": n.link,
@@ -84,139 +84,175 @@ def trend_keywords(request: Request):
 
 
 # =========================================================
-# helpers: analysis normalize (flat schema)
+# helpers: analysis normalize (NEW main-summary schema)
 # =========================================================
 def _as_list(v: Any) -> list:
     return v if isinstance(v, list) else []
 
 
-def _coalesce_list(d: Dict[str, Any], key: str) -> list:
-    v = d.get(key)
-    return v if isinstance(v, list) else []
-
-
-def _normalize_analysis_payload(raw: Any) -> Optional[Dict[str, Any]]:
+def _normalize_vocabulary(v: Any) -> list:
     """
-    프론트(NewsInsightModal)가 기대하는 flat schema로 정규화.
-
-    허용 입력 형태 예:
-    1) flat:
-       {"bullet_points":[...], "what_is_this":[...], ...}
-
-    2) nested (news main-summary에서 보던 형태):
-       {
-         "analysis": {
-           "summary": "...",
-           "bullet_points":[...],
-           ...
-         },
-         "keywords":[...],
-         "vocabulary":[...]
-       }
-
-    3) 더 깊이:
-       {"analysis": {"analysis": {...}, "vocabulary":[...]}}
+    vocabulary 항목 보정: [{term, definition}, ...]
     """
-    if not raw or not isinstance(raw, dict):
-        return None
-
-    # 0) 이미 flat인지 먼저 확인
-    if any(k in raw for k in ("bullet_points", "what_is_this", "why_important", "stock_impact", "investment_action")):
-        flat = dict(raw)
-    else:
-        # 1) raw.get("analysis")가 dict면 그걸 1차로 본다
-        a = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else raw
-
-        # 2) a 안에 analysis가 또 있으면 (analysis.analysis) 언랩
-        if isinstance(a, dict) and isinstance(a.get("analysis"), dict) and any(
-            k in a["analysis"] for k in ("bullet_points", "what_is_this", "why_important", "stock_impact", "investment_action")
-        ):
-            core = a["analysis"]
-            flat = dict(core)
-
-            # vocabulary가 바깥(a)에 있을 수 있으니 병합
-            if "vocabulary" not in flat and isinstance(a.get("vocabulary"), list):
-                flat["vocabulary"] = a.get("vocabulary")
-        else:
-            # 3) a 자체가 core일 수도 있음
-            if isinstance(a, dict):
-                flat = dict(a)
-            else:
-                return None
-
-        # 4) raw(최상위)에 vocabulary가 있고 flat에 없으면 병합
-        if "vocabulary" not in flat and isinstance(raw.get("vocabulary"), list):
-            flat["vocabulary"] = raw.get("vocabulary")
-
-    # -------------------------
-    # ✅ flat schema 강제 보정(빈값 기본값 채움)
-    # -------------------------
-    flat.setdefault("bullet_points", [])
-    flat.setdefault("what_is_this", [])
-    flat.setdefault("why_important", [])
-    flat.setdefault("investment_action", [])
-    flat.setdefault("vocabulary", [])
-
-    if not isinstance(flat.get("bullet_points"), list):
-        flat["bullet_points"] = []
-    if not isinstance(flat.get("what_is_this"), list):
-        flat["what_is_this"] = []
-    if not isinstance(flat.get("why_important"), list):
-        flat["why_important"] = []
-    if not isinstance(flat.get("investment_action"), list):
-        # action_guide(문자열)만 있는 경우를 investment_action으로 승격
-        ag = flat.get("action_guide")
-        if isinstance(ag, str) and ag.strip():
-            flat["investment_action"] = [ag.strip()]
-        else:
-            flat["investment_action"] = []
-
-    # stock_impact 구조 보정
-    si = flat.get("stock_impact")
-    if not isinstance(si, dict):
-        si = {}
-    si.setdefault("positives", [])
-    si.setdefault("warnings", [])
-    if not isinstance(si.get("positives"), list):
-        si["positives"] = []
-    if not isinstance(si.get("warnings"), list):
-        si["warnings"] = []
-    flat["stock_impact"] = si
-
-    # strategy_guide 구조 보정
-    sg = flat.get("strategy_guide")
-    if not isinstance(sg, dict):
-        sg = {"short_term": "정보 없음", "long_term": "정보 없음"}
-    else:
-        sg.setdefault("short_term", sg.get("short_term") or "정보 없음")
-        sg.setdefault("long_term", sg.get("long_term") or "정보 없음")
-    flat["strategy_guide"] = sg
-
-    # vocabulary 항목 보정( {term, definition} )
-    vocab = flat.get("vocabulary")
-    if not isinstance(vocab, list):
-        vocab = []
-    norm_vocab = []
-    for x in vocab:
+    if not isinstance(v, list):
+        return []
+    out = []
+    for x in v:
         if not isinstance(x, dict):
             continue
         term = str(x.get("term") or "").strip()
         definition = str(x.get("definition") or "").strip()
         if term:
-            norm_vocab.append({"term": term, "definition": definition})
-    flat["vocabulary"] = norm_vocab
+            out.append({"term": term, "definition": definition})
+    return out
 
-    return flat
+
+def _normalize_stock_impact(v: Any) -> Dict[str, list]:
+    """
+    stock_impact 보정: {"positives": [...], "warnings": [...]}
+    """
+    if not isinstance(v, dict):
+        v = {}
+    positives = v.get("positives")
+    warnings = v.get("warnings")
+    return {
+        "positives": positives if isinstance(positives, list) else [],
+        "warnings": warnings if isinstance(warnings, list) else [],
+    }
+
+
+def _coerce_int_0_100(v: Any, default: int = 50) -> int:
+    try:
+        x = int(float(v))
+    except Exception:
+        return default
+    return max(0, min(100, x))
+
+
+def _normalize_analysis_payload(raw: Any) -> Optional[Dict[str, Any]]:
+    """
+    프론트(모달)가 사용할 수 있도록, '아까 만든 main-summary 스키마'에 맞춘 flat payload로 정규화.
+
+    목표 출력(flat):
+    {
+      "keywords": [...],
+      "sentiment_score": 0~100,
+      "vocabulary": [{term, definition}, ...],
+      "analysis": {
+        "body_summary_30pct": "...",
+        "summary": "...",
+        "bullet_points": [...],
+        "what_is_this": [...],
+        "why_important": [...],
+        "stock_impact": {"positives":[...], "warnings":[...]}
+      }
+    }
+
+    허용 입력 형태(최대한 복구):
+    1) new schema:
+       {
+         "keywords":[...],
+         "sentiment_score": 75,
+         "vocabulary":[...],
+         "analysis": {...}
+       }
+
+    2) flat(core만):
+       {"summary":"...", "bullet_points":[...], ...}
+
+    3) nested:
+       {"analysis": {"summary":"...", ...}, "vocabulary":[...], ...}
+
+    4) 더 깊이:
+       {"analysis": {"analysis": {...}, "vocabulary":[...]}}
+    """
+    if not raw or not isinstance(raw, dict):
+        return None
+
+    # -------------------------
+    # 1) core analysis dict 찾기
+    # -------------------------
+    core: Dict[str, Any] = {}
+    vocab_src: Any = None
+
+    # new schema 형태(상위에 analysis dict 존재)
+    if isinstance(raw.get("analysis"), dict) and any(
+        k in raw["analysis"] for k in ("summary", "bullet_points", "what_is_this", "why_important", "stock_impact", "body_summary_30pct")
+    ):
+        core = raw["analysis"]
+        vocab_src = raw.get("vocabulary")
+
+    else:
+        # raw 자체가 core일 수도(legacy flat)
+        if any(k in raw for k in ("summary", "bullet_points", "what_is_this", "why_important", "stock_impact", "body_summary_30pct")):
+            core = raw
+            vocab_src = raw.get("vocabulary")
+        else:
+            # nested unwrap: a = raw["analysis"] or raw
+            a = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else raw
+
+            # analysis.analysis 형태 언랩
+            if isinstance(a, dict) and isinstance(a.get("analysis"), dict) and any(
+                k in a["analysis"] for k in ("summary", "bullet_points", "what_is_this", "why_important", "stock_impact", "body_summary_30pct")
+            ):
+                core = a["analysis"]
+                vocab_src = a.get("vocabulary") or raw.get("vocabulary")
+            elif isinstance(a, dict):
+                core = a
+                vocab_src = a.get("vocabulary") or raw.get("vocabulary")
+            else:
+                return None
+
+    # -------------------------
+    # 2) 상위 메타(키워드/감성/용어) 정규화
+    # -------------------------
+    keywords = raw.get("keywords")
+    if not isinstance(keywords, list):
+        # legacy: comma string
+        if isinstance(keywords, str) and keywords.strip():
+            keywords = [s.strip() for s in keywords.split(",") if s.strip()]
+        else:
+            keywords = []
+
+    sentiment_score = _coerce_int_0_100(raw.get("sentiment_score"), default=50)
+    vocabulary = _normalize_vocabulary(vocab_src)
+
+    # -------------------------
+    # 3) core analysis 정규화
+    # -------------------------
+    analysis = {
+        "body_summary_30pct": str(core.get("body_summary_30pct") or "").strip(),
+        "summary": str(core.get("summary") or "").strip(),
+        "bullet_points": _as_list(core.get("bullet_points")),
+        "what_is_this": _as_list(core.get("what_is_this")),
+        "why_important": _as_list(core.get("why_important")),
+        "stock_impact": _normalize_stock_impact(core.get("stock_impact")),
+    }
+
+    # 빈값 기본 보정(항상 키가 존재하도록)
+    analysis.setdefault("body_summary_30pct", "")
+    analysis.setdefault("summary", "")
+    analysis.setdefault("bullet_points", [])
+    analysis.setdefault("what_is_this", [])
+    analysis.setdefault("why_important", [])
+    analysis.setdefault("stock_impact", {"positives": [], "warnings": []})
+
+    return {
+        "keywords": keywords,
+        "sentiment_score": sentiment_score,
+        "vocabulary": vocabulary,
+        "analysis": analysis,
+    }
 
 
 # =========================================================
-# (NEW) reco Trend news detail summary view (LLM) - news.NewsSummaryView style
+# (NEW) reco Trend news detail summary view (LLM)
 # =========================================================
 class TrendNewsSummaryView(APIView):
     """
     GET /api/reco/news/<id>/summary/
     - TrendKeywordNews.analysis 없으면 analyze_trend_news로 생성 후 저장
-    - news.NewsSummaryView와 동일한 "analysis 캐시" 패턴
+    - main-summary 스키마(아까 만든 형태)로 정규화해서 반환
     """
     permission_classes = [AllowAny]
 
@@ -231,8 +267,8 @@ class TrendNewsSummaryView(APIView):
         if not analysis_data:
             analysis_data = analyze_trend_news(item, save_to_db=True)
 
-        flat = _normalize_analysis_payload(analysis_data)
-        if not flat:
+        normalized = _normalize_analysis_payload(analysis_data)
+        if not normalized:
             return Response({"error": "분석에 실패했습니다."}, status=500)
 
         return Response(
@@ -242,6 +278,6 @@ class TrendNewsSummaryView(APIView):
                 "trend_scope": item.trend.scope,
                 "trend_date": str(item.trend.date),
                 "article_title": item.title,
-                "analysis": flat,
+                "analysis": normalized,
             }
         )

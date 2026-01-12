@@ -81,53 +81,32 @@ def _ensure_schema(result: Dict[str, Any]) -> Dict[str, Any]:
     Canonical output for main-page analysis.
     - NO level_content / lv1~lv5 fields.
     - Single 'analysis' block is Lv3-style.
+    - REMOVE strategy_guide / action_guide (UI에서 불필요한 영역 제거)
+    - ADD body_summary_30pct inside analysis (원문 분량의 약 30% 요약)
     """
+    analysis_obj: Dict[str, Any] = (
+        result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+    )
+
     return {
         "deep_analysis_reasoning": str(result.get("deep_analysis_reasoning", "")).strip(),
         "keywords": _coerce_keywords(result.get("keywords")),
         "sentiment_score": _coerce_int_0_100(result.get("sentiment_score"), default=50),
         "vocabulary": _coerce_vocabulary(result.get("vocabulary")),
         "analysis": {
-            "summary": str(result.get("analysis", {}).get("summary", "")).strip()
+            # ✅ NEW: 본문 30% 요약 (analysis 내부로)
+            "body_summary_30pct": str(
+                analysis_obj.get("body_summary_30pct", "")
+                or result.get("body_summary_30pct", "")
+                or ""
+            ).strip(),
+            "summary": str(analysis_obj.get("summary", "")).strip()
             if isinstance(result.get("analysis"), dict)
             else str(result.get("summary", "")).strip(),
-            "bullet_points": (
-                result.get("analysis", {}).get("bullet_points", [])
-                if isinstance(result.get("analysis"), dict)
-                else result.get("bullet_points", [])
-            )
-            or [],
-            "what_is_this": (
-                result.get("analysis", {}).get("what_is_this", [])
-                if isinstance(result.get("analysis"), dict)
-                else result.get("what_is_this", [])
-            )
-            or [],
-            "why_important": (
-                result.get("analysis", {}).get("why_important", [])
-                if isinstance(result.get("analysis"), dict)
-                else result.get("why_important", [])
-            )
-            or [],
-            "stock_impact": (
-                result.get("analysis", {}).get("stock_impact", {})
-                if isinstance(result.get("analysis"), dict)
-                else result.get("stock_impact", {})
-            )
-            or {"positives": [], "warnings": []},
-            "strategy_guide": (
-                result.get("analysis", {}).get("strategy_guide", {})
-                if isinstance(result.get("analysis"), dict)
-                else result.get("strategy_guide", {})
-            )
-            or {"short_term": "", "long_term": ""},
-            "action_guide": str(
-                (
-                    result.get("analysis", {}).get("action_guide", "")
-                    if isinstance(result.get("analysis"), dict)
-                    else result.get("action_guide", "")
-                )
-            ).strip(),
+            "bullet_points": (analysis_obj.get("bullet_points", []) if isinstance(analysis_obj, dict) else []) or [],
+            "what_is_this": (analysis_obj.get("what_is_this", []) if isinstance(analysis_obj, dict) else []) or [],
+            "why_important": (analysis_obj.get("why_important", []) if isinstance(analysis_obj, dict) else []) or [],
+            "stock_impact": (analysis_obj.get("stock_impact", {}) if isinstance(analysis_obj, dict) else {}) or {"positives": [], "warnings": []},
         },
     }
 
@@ -141,6 +120,8 @@ def analyze_news_main(article: NewsArticle, save_to_db: bool = True) -> Optional
     - Removes the whole level_content concept.
     - Produces a single 'analysis' section written in Lv3 tone:
       industry trend + terminology allowed + portfolio perspective.
+    - UI에서 불필요한 strategy_guide / action_guide 제거
+    - analysis.body_summary_30pct (본문 30% 요약) 추가
     """
     content_to_analyze = article.content if article.content else article.summary
     if not content_to_analyze:
@@ -155,7 +136,6 @@ def analyze_news_main(article: NewsArticle, save_to_db: bool = True) -> Optional
 - 산업 트렌드/밸류체인 관점으로 설명할 것.
 - 기술적/산업 용어 사용 가능(단, 용어는 vocabulary에 초보자용 정의를 함께 제공).
 - 포트폴리오 관점(업종 노출, 리스크 요인, 촉매/모멘텀, 시나리오)에서 해석할 것.
-- 단기/중장기 전략을 구분해 제시할 것(예: 이벤트 드리븐/모멘텀 vs 사이클/구조적 성장).
 - 과도한 확정 표현 금지: 가능한 경우 조건부/시나리오 기반으로 작성.
 
 [기사 정보]
@@ -171,6 +151,7 @@ def analyze_news_main(article: NewsArticle, save_to_db: bool = True) -> Optional
     {{"term": "기사에_나온_어려운_용어", "definition": "해당 용어에 대한 초보자용 해설"}}
   ],
   "analysis": {{
+    "body_summary_30pct": "기사 본문을 기준으로 (글자수/문장수 기준) 원문 분량의 약 30% 내외로 압축 요약한 단락",
     "summary": "Lv3 톤으로 요약(산업/포트폴리오 관점)",
     "bullet_points": ["핵심 요약 1", "핵심 요약 2", "핵심 요약 3"],
     "what_is_this": ["심도 있는 뉴스 해석 1", "심도 있는 뉴스 해석 2"],
@@ -178,12 +159,7 @@ def analyze_news_main(article: NewsArticle, save_to_db: bool = True) -> Optional
     "stock_impact": {{
       "positives": ["상승 재료 1", "상승 재료 2"],
       "warnings": ["하락 리스크 1", "하락 리스크 2"]
-    }},
-    "strategy_guide": {{
-      "short_term": "기술적/모멘텀/이벤트 요인을 포함한 단기 대응",
-      "long_term": "산업 사이클/구조적 성장/리레이팅 가능성을 포함한 중장기 관점"
-    }},
-    "action_guide": "중급자를 위한 포트폴리오 액션(비중/헤지/관찰지표)"
+    }}
   }}
 }}
 
@@ -191,6 +167,7 @@ def analyze_news_main(article: NewsArticle, save_to_db: bool = True) -> Optional
 1) deep_analysis_reasoning을 반드시 가장 먼저 작성.
 2) 반드시 위 JSON 스키마를 준수.
 3) sentiment_score는 0~100 정수.
+4) analysis.body_summary_30pct는 '내용(본문)' 기준으로 원문 분량의 약 30% 내외가 되도록 요약(너무 짧게 1~2문장 금지).
 """
 
     try:

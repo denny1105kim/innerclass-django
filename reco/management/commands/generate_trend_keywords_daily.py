@@ -40,7 +40,7 @@ REQUEST_TIMEOUT = 8.0
 KST = ZoneInfo("Asia/Seoul")
 
 # ✅ “과거 뉴스 절대 안됨”
-MAX_AGE_DAYS = 2
+MAX_AGE_DAYS = 4
 
 # ✅ 본문 저장 최대 길이
 CONTENT_MAX_CHARS = 6000

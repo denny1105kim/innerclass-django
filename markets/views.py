@@ -2,15 +2,21 @@
 from __future__ import annotations
 
 from datetime import date as _date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework.decorators import api_view
+from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from .models import DailyRankingSnapshot, MarketChoices, RankingTypeChoices
+
+# NEW: session status API
+from markets.services.market_session import get_market_session_info
+from markets.services.session_status import MarketSessionStatus
 
 
 def _parse_date_yyyy_mm_dd(date_str: str) -> _date:
@@ -30,6 +36,21 @@ def _serialize_ranking(s: DailyRankingSnapshot) -> dict:
         "name": s.name,
         "trade_price": float(s.trade_price) if s.trade_price is not None else None,
         "change_rate": float(s.change_rate) if s.change_rate is not None else None,
+    }
+
+
+def _serialize_session(info) -> Dict[str, Any]:
+    """
+    get_market_session_info() 결과를 프론트가 쓰기 좋은 형태로 직렬화.
+    """
+    # info.next_open_at / prev_close_at 는 UTC일 수 있으니, ISO로 그대로(타임존 포함) 전달
+    return {
+        "status": info.status.value if hasattr(info.status, "value") else str(info.status),
+        "asof": info.asof.isoformat(),
+        "calendar_code": info.calendar_code,
+        "reason": info.reason,
+        "next_open_at": info.next_open_at.isoformat() if info.next_open_at else None,
+        "prev_close_at": info.prev_close_at.isoformat() if info.prev_close_at else None,
     }
 
 
@@ -190,15 +211,9 @@ def symbol_suggest(request: Request):
     if market != "ALL":
         qs = qs.filter(market=market)
 
-    # q는 symbol_code / name 둘 다에서 검색
-    # - symbol_code: "A005930" / "AAPL" 등
-    # - name: "삼성전자" / "Apple Inc." 등
-    # 대소문자/부분일치
     q_norm = q.strip()
     qs = qs.filter(Q(symbol_code__icontains=q_norm) | Q(name__icontains=q_norm))
 
-    # 최신 랭킹/중복 제거를 위해 symbol_code 기준 distinct 느낌으로
-    # (DB에 distinct on이 어려우면, Python에서 후처리)
     qs = qs.order_by("symbol_code", "rank")[:500]
 
     results: List[Dict[str, Any]] = []
@@ -213,3 +228,53 @@ def symbol_suggest(request: Request):
             break
 
     return Response({"market": market, "asof": asof.isoformat(), "results": results})
+
+
+# =========================================================
+# NEW: MarketSessionsView
+#   GET /api/markets/sessions/?pre_open_grace_min=5&post_close_grace_min=10&markets=KOSPI,KOSDAQ,NASDAQ
+# =========================================================
+class MarketSessionsView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request: Request):
+        # grace params
+        try:
+            pre = int((request.query_params.get("pre_open_grace_min") or "5").strip())
+        except Exception:
+            pre = 5
+        try:
+            post = int((request.query_params.get("post_close_grace_min") or "10").strip())
+        except Exception:
+            post = 10
+        pre = max(0, min(pre, 120))
+        post = max(0, min(post, 240))
+
+        # markets param (optional)
+        markets_param = (request.query_params.get("markets") or "").strip()
+        allowed_markets = [MarketChoices.KOSPI, MarketChoices.KOSDAQ, MarketChoices.NASDAQ]
+        if markets_param:
+            requested = [m.strip().upper() for m in markets_param.split(",") if m.strip()]
+            markets = [m for m in requested if m in allowed_markets]
+            if not markets:
+                return Response({"detail": "markets must be comma-separated KOSPI,KOSDAQ,NASDAQ"}, status=400)
+        else:
+            markets = allowed_markets
+
+        sessions: Dict[str, Any] = {}
+        for m in markets:
+            info = get_market_session_info(
+                market=m,
+                pre_open_grace_min=pre,
+                post_close_grace_min=post,
+            )
+            sessions[m] = _serialize_session(info)
+
+        return Response(
+            {
+                "asof": timezone.now().isoformat(),
+                "pre_open_grace_min": pre,
+                "post_close_grace_min": post,
+                "sessions": sessions,
+            }
+        )

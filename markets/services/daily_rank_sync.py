@@ -5,9 +5,11 @@ from datetime import date
 from typing import Any, Dict, Iterable, Optional, List
 
 from django.db import transaction
+from django.utils import timezone
 
 from markets.models import DailyRankingSnapshot, MarketChoices, RankingTypeChoices
 from markets.services.finance import DaumFinanceClient, SlickChartsNasdaq100Client
+from markets.services.market_calendar import should_run_sync
 
 
 # -------------------------------------------------
@@ -153,8 +155,37 @@ def replace_ranking(*, asof: date, market: str, ranking_type: str, rows: Iterabl
     return len(objs)
 
 
-def sync_daily_rankings(*, asof: Optional[date] = None, per_page: int = 200) -> Dict[str, int]:
+def sync_daily_rankings(
+    *,
+    asof: Optional[date] = None,
+    per_page: int = 200,
+    force: bool = False,
+    check_open: bool = True,
+    pre_open_grace_min: int = 0,
+    post_close_grace_min: int = 0,
+) -> Dict[str, int]:
+    """Sync ranking snapshots.
+
+    Parameters
+    ----------
+    asof:
+        Snapshot date (default: today).
+    per_page:
+        Number of rows to fetch per ranking.
+    force:
+        If True, run regardless of market open/close state.
+    check_open:
+        If False, skip open/close gating entirely.
+
+    Notes
+    -----
+    This function is commonly executed on a short interval (e.g., every few
+    minutes). When `check_open` is enabled, each market is skipped unless the
+    relevant exchange is currently open.
+    """
+
     asof = asof or date.today()
+    now = timezone.now()
 
     daum = DaumFinanceClient()
     slick = SlickChartsNasdaq100Client()
@@ -165,6 +196,12 @@ def sync_daily_rankings(*, asof: Optional[date] = None, per_page: int = 200) -> 
     # KR
     # ----------------------------
     for market in (MarketChoices.KOSPI, MarketChoices.KOSDAQ):
+        if check_open:
+            st = should_run_sync(market=market, now=now, force=force, pre_open_grace_min=pre_open_grace_min, post_close_grace_min=post_close_grace_min)
+            if not st.is_open:
+                results[f"{market}.SKIPPED"] = 0
+                continue
+
         cap = daum.get_market_cap(market=market, page=1, per_page=per_page)
         results[f"{market}.MARKET_CAP"] = replace_ranking(
             asof=asof, market=market, ranking_type=RankingTypeChoices.MARKET_CAP, rows=cap.data
@@ -185,6 +222,12 @@ def sync_daily_rankings(*, asof: Optional[date] = None, per_page: int = 200) -> 
     # ----------------------------
     market = MarketChoices.NASDAQ
     try:
+        if check_open:
+            st = should_run_sync(market=market, now=now, force=force, pre_open_grace_min=pre_open_grace_min, post_close_grace_min=post_close_grace_min)
+            if not st.is_open:
+                results[f"{market}.SKIPPED"] = 0
+                return results
+
         nas_cap = slick.get_nasdaq_market_cap(per_page=per_page)
         results[f"{market}.MARKET_CAP"] = replace_ranking(
             asof=asof, market=market, ranking_type=RankingTypeChoices.MARKET_CAP, rows=nas_cap.data

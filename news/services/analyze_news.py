@@ -1,22 +1,83 @@
+# news/services/analyze_news.py
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, Optional
+
 import openai
 from django.conf import settings
-import json
-from .models import NewsArticle
+from django.db import transaction
 
-def analyze_news(article: NewsArticle, save_to_db=True):
+from news.models import NewsArticle, NewsArticleAnalysis, NewsTheme
+
+
+THEME_CHOICES = [
+    "SEMICONDUCTOR_AI",
+    "BATTERY",
+    "GREEN_ENERGY",
+    "FINANCE_HOLDING",
+    "ICT_PLATFORM",
+    "BIO_HEALTH",
+    "AUTO",
+    "ETC",
+]
+
+
+def _strip_code_fences(text: str) -> str:
+    t = (text or "").strip()
+    if not t.startswith("```"):
+        return t
+    parts = t.split("```")
+    if len(parts) < 3:
+        return t
+    inner = parts[1].strip()
+    if inner.lower().startswith("json"):
+        inner = inner[4:].strip()
+    return inner.strip()
+
+
+def _safe_theme(v: str) -> str:
+    vv = (v or "").strip().upper()
+    allowed = {x for x, _ in NewsTheme.choices}
+    return vv if vv in allowed else NewsTheme.ETC
+
+
+def _build_level_payload(full: Dict[str, Any], level_key: str) -> Dict[str, Any]:
+    """
+    full 결과에서 공통(meta) + 특정 레벨(level_content[level_key])를 합쳐서
+    해당 레벨 row에 저장하기 좋은 JSON으로 만든다.
+    """
+    common = {
+        "deep_analysis_reasoning": full.get("deep_analysis_reasoning", ""),
+        "theme": full.get("theme", NewsTheme.ETC),
+        "keywords": full.get("keywords", []),
+        "sentiment_score": full.get("sentiment_score", None),
+        "vocabulary": full.get("vocabulary", []),
+    }
+    level_content = (full.get("level_content") or {}).get(level_key) or {}
+    if not isinstance(level_content, dict):
+        level_content = {}
+
+    merged = dict(common)
+    merged.update(level_content)
+    return merged
+
+
+def analyze_news(article: NewsArticle, save_to_db: bool = True) -> Optional[Dict[str, Any]]:
     """
     기사 객체를 받아 LLM 분석을 수행하고 결과를 반환합니다.
-    save_to_db=True일 경우 결과를 DB에 저장합니다.
+    save_to_db=True일 경우:
+      - NewsArticle.theme 를 Lv1 기반 theme으로 저장
+      - NewsArticleAnalysis에 Lv1~Lv5 row를 각각 upsert
     """
-    content_to_analyze = article.content if article.content else article.summary
-    
+    content_to_analyze = (article.content or "").strip() or (article.summary or "").strip()
     if not content_to_analyze:
         return None
 
     try:
-        # settings에 있는 API 키 사용 (로컬 LLM/Ollama 사용 시 base_url 등 설정 필요)
         client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
-        
+
+        # ====== 원본 프롬프트 유지 + theme 분류만 추가 ======
         prompt = f"""다음 뉴스 기사를 심층 분석하여 아래 형식의 JSON으로 응답해줘. 
 다른 말은 덧붙이지 말고 반드시 JSON 데이터만 출력해.
 
@@ -24,8 +85,22 @@ def analyze_news(article: NewsArticle, save_to_db=True):
 제목: {article.title}
 내용: {content_to_analyze}
 
+[추가 요청 - Theme 분류]
+아래 theme 중 이 뉴스가 어디에 속하는지 하나만 선택해서 "theme" 필드에 넣어줘:
+{THEME_CHOICES}
+- 반도체/AI/칩/파운드리/HBM/GPU/데이터센터/LLM 인프라 중심이면 SEMICONDUCTOR_AI
+- 배터리/리튬/양극재/전해질/2차전지 밸류체인이면 BATTERY
+- 재생에너지/탄소중립/수소/태양광/풍력/정책이면 GREEN_ENERGY
+- 은행/증권/보험/금융지주/금리/대출/예대마진이면 FINANCE_HOLDING
+- 플랫폼/클라우드/SaaS/인터넷/ICT 서비스면 ICT_PLATFORM
+- 바이오/제약/헬스케어/임상/FDA면 BIO_HEALTH
+- 자동차/부품/자율주행/모빌리티면 AUTO
+- 그 외는 ETC
+
 [응답 형식 (JSON)]
 {{
+    "theme": "ETC",
+
     "deep_analysis_reasoning": "여기에는 뉴스 분석을 위한 심층적인 사고 과정을 서술해. 먼저 팩트를 나열하고, 이것이 거시경제(금리, 환율)와 해당 산업 밸류체인에 미칠 영향을 논리적으로 추론해. 이 필드는 사용자에게 보여지지 않지만, 뒤이어 나올 전문가용(Lv5) 분석의 질을 높이기 위한 브레인스토밍 공간이야.",
     
     "keywords": ["핵심키워드1", "핵심키워드2", "핵심키워드3"],
@@ -121,32 +196,49 @@ def analyze_news(article: NewsArticle, save_to_db=True):
 """
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini", 
+            model="gpt-4o-mini",
             messages=[
-                # 시스템 프롬프트: '금융 전문가' 페르소나를 강력하게 주입. CoT를 유도하기 위한 지시 추가.
-                {"role": "system", "content": "당신은 월스트리트의 수석 애널리스트이자, 동시에 친절한 금융 교육자입니다. 당신의 목표는 독자의 수준(Lv1~Lv5)에 맞춰 완벽하게 다른 톤앤매너로 정보를 전달하는 것입니다. 분석 전 반드시 심층 추론(deep_analysis_reasoning)을 수행하세요."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": "당신은 월스트리트의 수석 애널리스트이자, 동시에 친절한 금융 교육자입니다. JSON만 출력하세요."},
+                {"role": "user", "content": prompt},
             ],
             temperature=0.7,
-            max_tokens=3000 # 분석 내용이 길어질 수 있으므로 토큰 여유 확보
+            max_tokens=3000,
         )
-        
-        result_text = response.choices[0].message.content.strip()
-        
-        # JSON 블록 추출 (마크다운 포맷 제거)
-        if result_text.startswith("```"):
-            result_text = result_text.split("```")[1]
-            if result_text.strip().startswith("json"):
-                result_text = result_text.strip()[4:]
-        
-        result = json.loads(result_text)
-        
+
+        result_text = (response.choices[0].message.content or "").strip()
+        result_text = _strip_code_fences(result_text)
+
+        full = json.loads(result_text)
+
+        # theme 보정
+        theme = _safe_theme(str(full.get("theme", "")))
+        full["theme"] = theme
+
         if save_to_db:
-            article.analysis = result
-            article.save()
-            
-        return result
-        
+            with transaction.atomic():
+                # 대표 theme은 Lv1이 정한 theme으로 NewsArticle에 저장
+                if article.theme != theme:
+                    article.theme = theme
+                    article.save(update_fields=["theme"])
+
+                # Lv1~Lv5 각각 row 저장
+                level_map = {
+                    1: "lv1",
+                    2: "lv2",
+                    3: "lv3",
+                    4: "lv4",
+                    5: "lv5",
+                }
+                for level, key in level_map.items():
+                    payload = _build_level_payload(full, key)
+                    NewsArticleAnalysis.objects.update_or_create(
+                        article=article,
+                        level=level,
+                        defaults={"theme": theme, "analysis": payload},
+                    )
+
+        return full
+
     except Exception as e:
-        print(f"Error analyzing news: {e}") # 디버깅을 위해 에러 출력 추가
+        print(f"Error analyzing news: {e}")
         return None

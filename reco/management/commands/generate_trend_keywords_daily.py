@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 from django.core.management.base import BaseCommand
+from django.core.management import call_command
 from django.db import transaction
 from django.utils import timezone
 
@@ -913,7 +914,8 @@ class Command(BaseCommand):
     help = (
         "Generate trend keywords (KR/US 3 each) and news per keyword: "
         "collect up to 100 candidates, de-dup by url/title, pick newest with images, "
-        "and de-dup across keywords per scope; save up to 15 incl. content."
+        "and de-dup across keywords per scope; save up to 15 incl. content. "
+        "After saving, auto-runs analyze_trend_keyword_news with no args."
     )
 
     def handle(self, *args, **opts):
@@ -1024,3 +1026,14 @@ class Command(BaseCommand):
                     f"[{today}] scope={scope} saved={saved} keywords with up to {NEWS_LIMIT} news each (content included, de-duplicated)."
                 )
             )
+
+        # ✅ KR/US 모두 저장 완료 후 자동 분석 실행
+        self.stdout.write("=========================================")
+        self.stdout.write("🔎 Auto-run: analyze_trend_keyword_news (pending only)")
+        self.stdout.write("=========================================")
+
+        try:
+            call_command("analyze_trend_keyword_news")
+            self.stdout.write(self.style.SUCCESS("✅ Auto analysis finished: analyze_trend_keyword_news"))
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"❌ Auto analysis failed: {e}"))

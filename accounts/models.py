@@ -8,7 +8,7 @@ User = get_user_model()
 
 class UserProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
-    asset_type = models.CharField(max_length=50, blank=True, null=True)
+    asset_type = ArrayField(models.CharField(max_length=50), blank=True, default=list)
     sectors = ArrayField(models.CharField(max_length=100), blank=True, default=list)
     portfolio = ArrayField(models.CharField(max_length=100), blank=True, default=list)
     risk_profile = models.CharField(max_length=10, blank=True, null=True)

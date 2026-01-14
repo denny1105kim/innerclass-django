@@ -1,4 +1,3 @@
-# apps/reco/management/commands/generate_trend_keywords_daily.py
 from __future__ import annotations
 
 import json
@@ -12,6 +11,7 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 from django.core.management.base import BaseCommand
+from django.core.management import call_command
 from django.db import transaction
 from django.utils import timezone
 
@@ -24,35 +24,27 @@ from main.services.gemini_client import get_gemini_client, ChatMessage
 # =========================================================
 KEYWORD_LIMIT = 3
 
-# ✅ 최종 저장 개수(키워드별)
 NEWS_LIMIT = 15
 
-# ✅ 후보 풀: 키워드별로 최대 100개까지 모은 후 선별
 CANDIDATE_POOL_LIMIT = 100
 
-# ✅ LLM에서 한 번에 요청할 뉴스 개수
 BATCH_SIZE = 25
 
-# ✅ 후보가 부족하면 추가 검색 반복 횟수
 MAX_REFILL_ATTEMPTS = 10
 
 REQUEST_TIMEOUT = 8.0
 KST = ZoneInfo("Asia/Seoul")
 
-# ✅ “과거 뉴스 절대 안됨”
 MAX_AGE_DAYS = 4
 
-# ✅ 본문 저장 최대 길이
 CONTENT_MAX_CHARS = 6000
 
-# ✅ 기사 본문 최소 길이(너무 짧으면 목록/메인/중계일 확률 높음)
 MIN_ARTICLE_TEXT_CHARS = 180
 
 BLOCKED_DOMAINS = {
     "example.com",
     "vertexaisearch.cloud.google.com",
     "webcache.googleusercontent.com",
-    # 검색/중계 류(필요 시 확장)
     "news.google.com",
 }
 
@@ -361,30 +353,20 @@ def _looks_like_article_url(url: str) -> bool:
             if hint in path:
                 return False
 
-        # 너무 짧은 path는 섹션일 가능성
         if len(path.strip("/").split("/")) <= 1 and len(path) < 18:
             return False
 
-        # 기사 ID/날짜 류가 있으면 기사일 확률 증가
         if re.search(r"\b(20\d{2}[./-]\d{1,2}[./-]\d{1,2})\b", path):
             return True
         if re.search(r"\b\d{6,}\b", path):
             return True
 
-        # 위에서 섹션류는 걸렀으므로 기본 True
         return True
     except Exception:
         return False
 
 
 def _finalize_article_url(url: str) -> tuple[str, Optional[str]]:
-    """
-    URL을 '정식 기사 URL'로 확정:
-    1) redirect param 언랩
-    2) GET으로 리다이렉트 따라 final url 확보
-    3) HTML에서 canonical/og:url로 최종 확정
-    반환: (final_url, html_or_none)
-    """
     u0 = _unwrap_redirect_url(url)
     if not _is_http_url(u0):
         return u0, None
@@ -649,10 +631,6 @@ def _resolve_image_url(article_link: str, candidate_image_url: str, html: Option
 
     return "", True
 
-
-# =========================================================
-# Normalize / rank
-# =========================================================
 @dataclass
 class NewsNorm:
     title: str
@@ -675,24 +653,17 @@ def _normalize_news_item(n: dict, now_kst: datetime) -> Optional[NewsNorm]:
     if not link_raw:
         return None
 
-    # ✅ 1) 정식 URL 확정 + HTML 1회 확보
     link, html = _finalize_article_url(link_raw)
     link = (link or "").strip()
     if not link:
         return None
-
-    # ✅ 2) 블락/중계 도메인 제거
     if _is_blocked_url(link):
         return None
-
-    # ✅ 3) 기사 URL 형태 휴리스틱(섹션/목록/메인 제거)
     if not _looks_like_article_url(link):
         return None
 
     title = _sanitize_text(n.get("title"), 300).strip()
     summary = _sanitize_text(n.get("summary"), 1000).strip()
-
-    # ✅ 4) 발행시각 확정(후보 -> HTML meta/time fallback)
     pub_str = _resolve_published_at_kst_min(link, _sanitize_text(n.get("published_at"), 100))
     if not pub_str:
         return None
@@ -703,8 +674,6 @@ def _normalize_news_item(n: dict, now_kst: datetime) -> Optional[NewsNorm]:
 
     if not _is_recent_kst(dt, now_kst):
         return None
-
-    # ✅ 5) 콘텐츠 확보 (이미 html을 받았으면 재사용)
     if not html:
         html = _fetch_html(link)
 
@@ -714,8 +683,6 @@ def _normalize_news_item(n: dict, now_kst: datetime) -> Optional[NewsNorm]:
     if html:
         content = _extract_article_text_from_html(html)
         content = content[:CONTENT_MAX_CHARS]
-
-    # ✅ 6) 기사성 최종 검증: 본문이 너무 짧으면 목록/메인일 확률 높음
     if len((content or "").strip()) < MIN_ARTICLE_TEXT_CHARS:
         return None
 
@@ -741,11 +708,6 @@ def _collect_candidates(
     used_titles: set[str],
     pool_limit: int,
 ) -> List[NewsNorm]:
-    """
-    후보 수집 시점에서 1차 중복 제거:
-    - canonical URL 중복 제거
-    - normalized title 중복 제거
-    """
     out: List[NewsNorm] = []
     for batch in raw_news_batches:
         for n in batch:
@@ -774,11 +736,7 @@ def _rank_and_pick(
     global_seen_urls: set[str],
     global_seen_titles: set[str],
 ) -> List[NewsNorm]:
-    """
-    1) 최신순(published_dt desc)
-    2) 이미지 있는 기사 우선
-    3) scope 전역 중복 제거(같은 기사가 다른 키워드에 또 나오지 않게)
-    """
+
     if not cands:
         return []
 
@@ -913,7 +871,8 @@ class Command(BaseCommand):
     help = (
         "Generate trend keywords (KR/US 3 each) and news per keyword: "
         "collect up to 100 candidates, de-dup by url/title, pick newest with images, "
-        "and de-dup across keywords per scope; save up to 15 incl. content."
+        "and de-dup across keywords per scope; save up to 15 incl. content. "
+        "After saving, auto-runs analyze_trend_keyword_news with no args."
     )
 
     def handle(self, *args, **opts):
@@ -926,7 +885,6 @@ class Command(BaseCommand):
         for scope in scopes:
             self.stdout.write(f"Requesting {scope} trends with Google Search...")
 
-            # ✅ scope 전역 중복 제거 세트(키워드 간 중복 방지)
             global_seen_urls: set[str] = set()
             global_seen_titles: set[str] = set()
 
@@ -957,11 +915,9 @@ class Command(BaseCommand):
             while len(items) < KEYWORD_LIMIT:
                 items.append({"keyword": "N/A", "reason": "데이터 없음", "news_seed": []})
 
-            # 키워드별 후보 100개 수집 -> 최신 + 이미지 우선 15개 저장(+본문)
             for it in items:
                 kw = it["keyword"]
 
-                # ✅ 키워드 후보 수집 단계의 중복 제거(키워드 내부)
                 used_urls: set[str] = set()
                 used_titles: set[str] = set()
 
@@ -1001,7 +957,6 @@ class Command(BaseCommand):
                     if attempts >= 3 and len(new_cands) == 0:
                         break
 
-                # ✅ pick 단계에서 "scope 전역 중복"까지 제거
                 picked = _rank_and_pick(
                     cands=candidates,
                     limit=NEWS_LIMIT,
@@ -1009,7 +964,6 @@ class Command(BaseCommand):
                     global_seen_titles=global_seen_titles,
                 )
 
-                # ✅ 저장 직전 방어 중복 제거
                 picked = _final_dedupe_for_save(picked)
 
                 it["picked_news"] = picked
@@ -1024,3 +978,13 @@ class Command(BaseCommand):
                     f"[{today}] scope={scope} saved={saved} keywords with up to {NEWS_LIMIT} news each (content included, de-duplicated)."
                 )
             )
+
+        self.stdout.write("=========================================")
+        self.stdout.write("🔎 Auto-run: analyze_trend_keyword_news (pending only)")
+        self.stdout.write("=========================================")
+
+        try:
+            call_command("analyze_trend_keyword_news")
+            self.stdout.write(self.style.SUCCESS("✅ Auto analysis finished: analyze_trend_keyword_news"))
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"❌ Auto analysis failed: {e}"))

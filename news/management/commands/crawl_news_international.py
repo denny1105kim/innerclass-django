@@ -1,127 +1,216 @@
-import time
-import requests
-from datetime import datetime
-from typing import Iterable, Optional
+from __future__ import annotations
 
-from django.core.management.base import BaseCommand
+import re
+import time
+from datetime import datetime, timedelta, timezone as py_timezone
+from typing import Optional
+from urllib.parse import urlparse, urlsplit, urlunsplit
+
+import requests
 from django.conf import settings
-from django.utils import timezone
+from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.utils import timezone
+
+from news.models import NewsArticle
+from news.services.analyze_news import analyze_news
 
 import openai
 
-from news.models import NewsArticle
-
 
 class Command(BaseCommand):
-    help = "NewsAPI 기반 해외(International) 뉴스(다양한 섹터/테마) 최신순 크롤링 후 DB 저장(+선행 분석). (API KEY 풀 자동 교체)"
+    help = (
+        "NewsAPI 기반 해외 뉴스 크롤링 (MASTER_TERMS 배치 쿼리 호출) "
+        "+ OpenAI embedding 저장 + Lv1~Lv5 선행 분석 저장 + theme 저장"
+    )
 
-    # =========================
-    # 고정 설정 (ARGS 없이 운영)
-    # =========================
-    MAX_ARTICLES = 200          # 최종 저장 목표 (중복/실패로 실제는 그 이하일 수 있음)
-    PAGE_SIZE = 100             # NewsAPI everything pageSize 최대 100
-    DAYS_LOOKBACK = 3           # 최근 N일
+    # -------------------------
+    # Targets / limits
+    # -------------------------
+    MAX_ARTICLES = 200
+
+    PAGE_SIZE = 50
+    MAX_PAGES = 2
+    DAYS_LOOKBACK = 3
     LANGUAGE = "en"
     MARKET = "International"
-    DEFAULT_SECTOR = "금융/경제"
 
-    # 카테고리별 쿼리 (다양성 확보용)
-    QUERIES = {
-        "macro": (
-            "economy OR macro OR markets OR stocks OR equities OR earnings OR guidance OR "
-            "\"interest rates\" OR inflation OR \"central bank\" OR Fed OR ECB OR BOJ OR "
-            "recession OR GDP OR unemployment OR \"bond yields\" OR treasury"
-        ),
-        "ai_semis_bigtech": (
-            "Nvidia OR NVDA OR AMD OR Intel OR Qualcomm OR TSMC OR ASML OR "
-            "\"artificial intelligence\" OR AI chips OR semiconductors OR GPU OR "
-            "Microsoft OR Apple OR Google OR Alphabet OR Amazon OR Meta"
-        ),
-        "energy_oil_gas": (
-            "oil OR crude OR Brent OR WTI OR OPEC OR shale OR refinery OR gasoline OR "
-            "\"natural gas\" OR LNG OR Exxon OR Chevron OR Shell OR BP"
-        ),
-        "renewables_cleantech": (
-            "renewable OR solar OR wind OR hydrogen OR geothermal OR \"clean energy\" OR "
-            "decarbonization OR \"carbon credits\" OR battery storage"
-        ),
-        "ev_auto_battery": (
-            "EV OR electric vehicle OR Tesla OR BYD OR Rivian OR Lucid OR "
-            "battery OR lithium-ion OR charging network OR autonomous driving"
-        ),
-        "financials": (
-            "banks OR banking OR \"net interest margin\" OR fintech OR payments OR "
-            "Visa OR Mastercard OR JPMorgan OR Goldman OR Morgan Stanley"
-        ),
-        "healthcare_biotech": (
-            "biotech OR pharma OR pharmaceuticals OR FDA OR clinical trial OR "
-            "Novo Nordisk OR Eli Lilly OR Pfizer OR Moderna"
-        ),
-        "industrials_defense": (
-            "aerospace OR defense OR Boeing OR Airbus OR Lockheed OR Raytheon OR "
-            "supply chain OR manufacturing OR industrial production"
-        ),
-        "materials_metals": (
-            "copper OR lithium OR nickel OR cobalt OR rare earths OR iron ore OR steel OR "
-            "mining OR \"critical minerals\""
-        ),
-        "consumer_retail": (
-            "consumer spending OR retail OR e-commerce OR Walmart OR Costco OR "
-            "Nike OR luxury goods OR travel demand"
-        ),
-        "crypto": (
-            "Bitcoin OR BTC OR Ethereum OR ETH OR crypto market OR \"spot ETF\" OR "
-            "SEC OR stablecoin"
-        ),
-    }
+    # 요청 간격
+    SLEEP_BETWEEN_PAGES = 0.2
+    SLEEP_BETWEEN_BATCHES = 0.35
 
-    # 200개 목표를 카테고리에 분배 (다양성 확보)
-    CATEGORY_QUOTA = {
-        "macro": 40,
-        "ai_semis_bigtech": 25,
-        "energy_oil_gas": 20,
-        "renewables_cleantech": 20,
-        "ev_auto_battery": 20,
-        "financials": 15,
-        "healthcare_biotech": 15,
-        "industrials_defense": 15,
-        "materials_metals": 15,
-        "consumer_retail": 10,
-        "crypto": 5,
-    }
+    # -------------------------
+    # Image filtering
+    # -------------------------
+    BAD_IMAGE_PATTERNS = [
+        r"placeholder",
+        r"default",
+        r"no[-_ ]?image",
+        r"no[-_ ]?photo",
+        r"image[-_ ]?not[-_ ]?available",
+        r"not[-_ ]?found",
+        r"spacer",
+        r"sprite",
+        r"blank",
+        r"transparent",
+        r"1x1",
+        r"pixel",
+        r"favicon",
+        r"icon",
+        r"logo",
+        r"thumb",
+    ]
+    BAD_PATH_EXT = (".html", ".htm", ".php", ".aspx", ".jsp")
+
+    VALIDATE_IMAGE_HEAD = True
+    IMAGE_HEAD_TIMEOUT = 4
+    MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB
+
+    # -------------------------
+    # MASTER TERMS (100
+    # -------------------------
+    MASTER_TERMS = [
+        # AI / Semicon (25)
+        "AI",
+        "\"artificial intelligence\"",
+        "LLM",
+        "GenAI",
+        "semiconductor",
+        "chip",
+        "GPU",
+        "HBM",
+        "DRAM",
+        "foundry",
+        "fab",
+        "EUV",
+        "ASML",
+        "TSMC",
+        "Nvidia",
+        "NVDA",
+        "AMD",
+        "Intel",
+        "Qualcomm",
+        "ARM",
+        "RISC-V",
+        "\"data center\"",
+        "inference",
+        "training",
+        "accelerator",
+        # Battery / EV (15)
+        "battery",
+        "\"lithium-ion\"",
+        "\"solid-state\"",
+        "cathode",
+        "anode",
+        "electrolyte",
+        "lithium",
+        "nickel",
+        "cobalt",
+        "LFP",
+        "NMC",
+        "CATL",
+        "\"battery recycling\"",
+        "EV",
+        "charging",
+        # Clean Energy (12)
+        "nuclear",
+        "SMR",
+        "uranium",
+        "\"clean energy\"",
+        "renewable",
+        "solar",
+        "wind",
+        "hydrogen",
+        "geothermal",
+        "\"carbon capture\"",
+        "grid",
+        "\"energy storage\"",
+        # Finance (10)
+        "bank",
+        "banking",
+        "fintech",
+        "payments",
+        "Visa",
+        "Mastercard",
+        "JPMorgan",
+        "Goldman",
+        "\"Morgan Stanley\"",
+        "\"interest rate\"",
+        # Platform / Cloud (12)
+        "cloud",
+        "SaaS",
+        "platform",
+        "Microsoft",
+        "Apple",
+        "Google",
+        "Alphabet",
+        "Amazon",
+        "Meta",
+        "telecom",
+        "5G",
+        "\"app store\"",
+        # Bio (10)
+        "biotech",
+        "pharma",
+        "healthcare",
+        "\"clinical trial\"",
+        "\"drug approval\"",
+        "FDA",
+        "\"medical device\"",
+        "Novo",
+        "\"Eli Lilly\"",
+        "Pfizer",
+        # Auto (10)
+        "automotive",
+        "automaker",
+        "Tesla",
+        "BYD",
+        "Toyota",
+        "Volkswagen",
+        "Hyundai",
+        "Kia",
+        "ADAS",
+        "\"self-driving\"",
+        # Shipbuilding (6)
+        "shipbuilding",
+        "shipyard",
+        "maritime",
+        "\"LNG carrier\"",
+        "tanker",
+        "\"offshore wind\"",
+    ]
 
     # NewsAPI 키 관련 에러 코드(이 경우 다음 키로 교체)
     ROTATE_ON_STATUS = {401, 403, 429}
 
-    def handle(self, *args, **kwargs):
-        keys = self._get_newsapi_keys()
-        if not keys:
-            self.stdout.write(
-                self.style.ERROR(
-                    "NEWSAPI 키가 없습니다. settings.NEWSAPI_KEYS(리스트) 또는 settings.NEWSAPI_KEY(단일)를 설정하세요."
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120 Safari/537.36"
                 )
-            )
-            return
+            }
+        )
 
-        if not getattr(settings, "OPENAI_API_KEY", None):
-            self.stdout.write(self.style.ERROR("settings.OPENAI_API_KEY 가 설정되어 있지 않습니다."))
-            return
+    # -------------------------
+    # Time helpers (UTC normalize)
+    # -------------------------
+    def _to_utc(self, dt: Optional[datetime]) -> datetime:
+        if not dt:
+            return timezone.now().astimezone(py_timezone.utc)
 
-        self.stdout.write("=========================================")
-        self.stdout.write("🌍 해외 뉴스 크롤링(NewsAPI) 시스템 가동 시작 (다양한 섹터/테마)")
-        self.stdout.write(f"- keys: {len(keys)}개 (자동 교체 활성화)")
-        self.stdout.write("=========================================")
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt, py_timezone.utc)
 
-        total_saved = self.crawl_newsapi_multiquery()
+        return dt.astimezone(py_timezone.utc)
 
-        self.stdout.write("=========================================")
-        self.stdout.write(self.style.SUCCESS(f"✅ 해외 뉴스 크롤링 완료. (총 신규 저장: {total_saved}개)"))
-        self.stdout.write("=========================================")
-
-    # =========================================================
-    # Key Pool
-    # =========================================================
+    # -------------------------
+    # Keys
+    # -------------------------
     def _get_newsapi_keys(self) -> list[str]:
         """
         우선순위:
@@ -139,15 +228,10 @@ class Command(BaseCommand):
 
         return []
 
-    # =========================================================
+    # -------------------------
     # NewsAPI request with auto-rotation
-    # =========================================================
+    # -------------------------
     def _newsapi_get(self, base_url: str, params: dict) -> requests.Response:
-        """
-        - apiKey는 params로 주입 (가장 안정적)
-        - 401/403/429면 다음 키로 자동 교체
-        - 네트워크 예외도 다음 키로 재시도
-        """
         keys = self._get_newsapi_keys()
         last_err: Optional[str] = None
 
@@ -156,12 +240,11 @@ class Command(BaseCommand):
             params_with_key["apiKey"] = api_key
 
             try:
-                res = requests.get(base_url, params=params_with_key, timeout=20)
+                res = self.session.get(base_url, params=params_with_key, timeout=20)
 
                 if res.status_code == 200:
                     return res
 
-                # 키/한도 문제면 다음 키로 교체
                 if res.status_code in self.ROTATE_ON_STATUS:
                     last_err = f"{res.status_code} {res.text[:200]}"
                     self.stdout.write(
@@ -171,7 +254,6 @@ class Command(BaseCommand):
                     )
                     continue
 
-                # 그 외 오류는 즉시 중단(재시도해도 의미 없는 경우가 많음)
                 last_err = f"{res.status_code} {res.text[:200]}"
                 break
 
@@ -186,204 +268,325 @@ class Command(BaseCommand):
 
         raise RuntimeError(f"NewsAPI 호출 실패: {last_err or 'unknown error'}")
 
-    # =========================================================
-    # OpenAI Embedding
-    # =========================================================
-    def get_embedding(self, text: str):
+    # -------------------------
+    # Query batches (MASTER_TERMS 기반)
+    # -------------------------
+    def _build_query_batches(self, chunk: int = 10) -> list[str]:
+        batches: list[str] = []
+        chunk = max(3, min(chunk, 20))
+        for i in range(0, len(self.MASTER_TERMS), chunk):
+            terms = self.MASTER_TERMS[i : i + chunk]
+            q = "(" + " OR ".join(terms) + ")"
+            batches.append(q)
+        return batches
+
+    # -------------------------
+    # Normalize / Duplicate
+    # -------------------------
+    def _normalize_title(self, title: str) -> str:
+        t = title or ""
+        t = re.sub(r"^[\d\.\s]+", "", t)
+        t = " ".join(t.split()).strip()
+        return t
+
+    def _normalize_url(self, url: str) -> str:
+        u = (url or "").strip()
+        if not u:
+            return ""
         try:
-            client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
-            response = client.embeddings.create(
-                input=text,
-                model="text-embedding-3-small",
-            )
-            return response.data[0].embedding
-        except Exception as e:
-            self.stdout.write(self.style.ERROR(f"⚠️ 임베딩 생성 실패: {e}"))
-            return None
+            parts = urlsplit(u)
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        except Exception:
+            return u
 
-    # =========================================================
-    # Save (국내 커맨드와 최대한 동일)
-    # =========================================================
-    def save_article(
-        self,
-        title: str,
-        summary: str,
-        link: str,
-        image_url: str | None,
-        source_name: str,
-        sector: str = "기타",
-        market: str = "International",
-        content: str | None = None,
-        published_at=None,
-    ) -> int:
-        # 중복 체크: 제목 또는 URL이 같으면 중복
-        if NewsArticle.objects.filter(title=title).exists():
-            self.stdout.write(f"  - [{source_name}] (중복-제목) {title[:15]}...")
-            return 0
+    def _is_duplicate(self, title: str, url: str) -> bool:
+        title_n = self._normalize_title(title)
+        url_n = self._normalize_url(url)
 
-        if NewsArticle.objects.filter(url=link).exists():
-            self.stdout.write(f"  - [{source_name}] (중복-URL) {title[:15]}...")
-            return 0
+        if url_n and NewsArticle.objects.filter(url=url_n).exists():
+            return True
+        if title_n and NewsArticle.objects.filter(title=title_n).exists():
+            return True
+        return False
 
-        self.stdout.write(f"  + [{source_name}] [New] {title[:15]}...")
+    # -------------------------
+    # Image checks
+    # -------------------------
+    def _looks_like_bad_image_url(self, image_url: str) -> bool:
+        u = (image_url or "").strip()
+        if not u:
+            return True
+        if not (u.startswith("http://") or u.startswith("https://")):
+            return True
 
-        # 임베딩: summary 기반 (NewsAPI content는 종종 잘림)
-        vector = self.get_embedding(summary)
-        if not vector:
-            self.stdout.write("    -> 벡터 생성 실패로 저장 건너뜀")
-            return 0
+        path = urlparse(u).path.lower()
+        if path.endswith(self.BAD_PATH_EXT):
+            return True
 
+        low = u.lower()
+        for pat in self.BAD_IMAGE_PATTERNS:
+            if re.search(pat, low):
+                return True
+        return False
+
+    def _is_real_image_by_head(self, image_url: str) -> bool:
         try:
-            published_at = published_at or timezone.now()
+            r = self.session.head(image_url, timeout=self.IMAGE_HEAD_TIMEOUT, allow_redirects=True)
+            if r.status_code >= 400:
+                return False
 
-            with transaction.atomic():
-                article = NewsArticle.objects.create(
-                    title=title,
-                    summary=summary,
-                    content=content,
-                    url=link,
-                    image_url=image_url,
-                    sector=sector,
-                    market=market,
-                    ticker=None,
-                    published_at=published_at,
-                    embedding=vector,
-                )
-
-                # LLM 선행 분석 및 저장 (국내 커맨드와 동일)
-                from news.services import analyze_news
-                analyze_news(article, save_to_db=True)
-
-            return 1
-
-        except Exception as e:
-            self.stdout.write(self.style.ERROR(f"    -> DB 저장 실패: {e}"))
-            return 0
-
-    # =========================================================
-    # NewsAPI Multi-Query Crawl
-    # =========================================================
-    def crawl_newsapi_multiquery(self) -> int:
-        base_url = "https://newsapi.org/v2/everything"
-
-        from_dt = timezone.now() - timezone.timedelta(days=self.DAYS_LOOKBACK)
-        from_str = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        total_saved = 0
-        total_saved_target = self.MAX_ARTICLES
-
-        for category, query in self.QUERIES.items():
-            if total_saved >= total_saved_target:
-                break
-
-            quota = int(self.CATEGORY_QUOTA.get(category, 10))
-            if quota <= 0:
-                continue
-
-            self.stdout.write(f"\n>>> [NewsAPI] category={category} quota={quota} 최신순 수집 중...")
-
-            saved_in_category = 0
-            seen_in_category = 0
-
-            # quota가 100 넘지 않으므로 보통 1페이지로 충분하지만,
-            # 중복/실패 대비로 최대 2페이지까지 시도 (필요시 늘릴 수 있음)
-            max_pages = 2
-            for page in range(1, max_pages + 1):
-                if saved_in_category >= quota:
-                    break
-                if total_saved >= total_saved_target:
-                    break
-
-                remaining_cat = quota - saved_in_category
-
-                # 중복 대비로 조금 더 요청 (단, NewsAPI max 100)
-                page_size = min(self.PAGE_SIZE, max(1, remaining_cat * 2))
-                page_size = min(page_size, self.PAGE_SIZE)
-
-                params = {
-                    "q": query,
-                    "language": self.LANGUAGE,
-                    "sortBy": "publishedAt",
-                    "pageSize": page_size,
-                    "page": page,
-                    "from": from_str,
-                }
-
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            clen = r.headers.get("Content-Length")
+            if clen:
                 try:
-                    res = self._newsapi_get(base_url, params)
-                    data = res.json()
+                    if int(clen) > self.MAX_IMAGE_BYTES:
+                        return False
+                except Exception:
+                    pass
 
-                    articles = data.get("articles") or []
-                    if not articles:
-                        self.stdout.write(f"  - articles=0 (category={category})")
-                        break
+            if ctype.startswith("image/"):
+                return True
 
-                    # 최신순 재정렬(안전)
-                    articles.sort(key=lambda a: (a.get("publishedAt") or ""), reverse=True)
-
-                    for a in articles:
-                        if saved_in_category >= quota:
-                            break
-                        if total_saved >= total_saved_target:
-                            break
-
-                        seen_in_category += 1
-
-                        title = (a.get("title") or "").strip()
-                        link = (a.get("url") or "").strip()
-                        if not title or not link:
-                            continue
-
-                        summary = (a.get("description") or "").strip() or title
-                        content = (a.get("content") or "").strip() or None
-                        image_url = (a.get("urlToImage") or "").strip() or None
-                        published_at = self._parse_published_at(a.get("publishedAt")) or timezone.now()
-
-                        source_name = "NewsAPI"
-                        src = a.get("source") or {}
-                        if isinstance(src, dict):
-                            source_name = (src.get("name") or "").strip() or source_name
-
-                        # DB 스키마를 국내와 최대한 동일하게 유지: sector는 "금융/경제" 고정(원하면 category로 변경 가능)
-                        sector = self.DEFAULT_SECTOR
-
-                        saved = self.save_article(
-                            title=title,
-                            summary=summary,
-                            link=link,
-                            image_url=image_url,
-                            source_name=source_name,
-                            sector=sector,
-                            market=self.MARKET,
-                            content=content,
-                            published_at=published_at,
-                        )
-
-                        if saved:
-                            saved_in_category += 1
-                            total_saved += 1
-
-                    time.sleep(0.2)
-
-                except Exception as e:
-                    self.stdout.write(self.style.ERROR(f"❌ NewsAPI 요청/파싱 실패(category={category}): {e}"))
-                    break
-
-            self.stdout.write(
-                f"<<< category={category} done: saved={saved_in_category}/{quota}, seen={seen_in_category}"
+            # HEAD가 부정확한 서버 대비: Range GET
+            rg = self.session.get(
+                image_url,
+                timeout=self.IMAGE_HEAD_TIMEOUT,
+                allow_redirects=True,
+                stream=True,
+                headers={"Range": "bytes=0-2047"},
             )
+            if rg.status_code >= 400:
+                return False
 
-        return total_saved
+            ctype2 = (rg.headers.get("Content-Type") or "").lower()
+            clen2 = (rg.headers.get("Content-Length") or "").strip()
+            if clen2:
+                try:
+                    if int(clen2) > self.MAX_IMAGE_BYTES:
+                        return False
+                except Exception:
+                    pass
 
-    def _parse_published_at(self, s: str):
-        # 예: 2026-01-08T08:12:00Z
+            return ctype2.startswith("image/")
+        except Exception:
+            return False
+
+    def _pick_valid_image_url(self, image_url: Optional[str]) -> Optional[str]:
+        u = (image_url or "").strip()
+        if not u:
+            return None
+        if self._looks_like_bad_image_url(u):
+            return None
+        if self.VALIDATE_IMAGE_HEAD and not self._is_real_image_by_head(u):
+            return None
+        return u
+
+    # -------------------------
+    # Datetime parse
+    # -------------------------
+    def _parse_iso_dt(self, s: Optional[str]) -> Optional[datetime]:
         if not s:
             return None
         try:
             s = s.replace("Z", "+00:00")
             dt = datetime.fromisoformat(s)
             if timezone.is_naive(dt):
-                dt = timezone.make_aware(dt, timezone=timezone.utc)
+                dt = timezone.make_aware(dt, py_timezone.utc)
             return dt
         except Exception:
             return None
+
+    # -------------------------
+    # OpenAI Embedding
+    # -------------------------
+    def get_embedding(self, text: str):
+        """
+        text-embedding-3-small: 1536 dims
+        """
+        try:
+            client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+            resp = client.embeddings.create(input=text, model="text-embedding-3-small")
+            return resp.data[0].embedding
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"⚠️ 임베딩 생성 실패: {e}"))
+            return None
+
+    # -------------------------
+    # Save + Analyze (Lv1~Lv5 저장 + theme 저장은 analyze_news가 담당)
+    # -------------------------
+    def save_article(
+        self,
+        *,
+        title: str,
+        summary: str,
+        link: str,
+        image_url: Optional[str],
+        source_name: str,
+        content: Optional[str],
+        published_at: Optional[datetime],
+    ) -> int:
+        title_n = self._normalize_title(title)
+        link_n = self._normalize_url(link)
+
+        if not title_n or not link_n:
+            return 0
+
+        if self._is_duplicate(title_n, link_n):
+            self.stdout.write(f"  - [{source_name}] (중복) {title_n[:60]}...")
+            return 0
+
+        valid_image_url = self._pick_valid_image_url(image_url)
+        if not valid_image_url:
+            self.stdout.write(f"  - [{source_name}] (이미지 invalid/없음) {title_n[:60]}... -> skip")
+            return 0
+
+        # 임베딩 텍스트: summary 우선
+        emb_text = (summary or title_n).strip() or title_n
+        vector = self.get_embedding(emb_text)
+        if not vector:
+            self.stdout.write("    -> 벡터 생성 실패로 저장 건너뜀")
+            return 0
+
+        pub_utc = self._to_utc(published_at)
+
+        try:
+            with transaction.atomic():
+                article = NewsArticle.objects.create(
+                    title=title_n,
+                    summary=summary,
+                    content=content,
+                    url=link_n,
+                    image_url=valid_image_url,
+                    market=self.MARKET,
+                    published_at=pub_utc,
+                    sector="금융/경제",
+                    ticker=None,
+
+                    embedding=vector,
+                )
+                analyze_news(article, save_to_db=True)
+
+            self.stdout.write(f"  + [{source_name}] [New] {title_n[:60]}... (analyzed Lv1~Lv5 + themed)")
+            return 1
+
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"    -> DB 저장 실패: {e}"))
+            return 0
+
+    # -------------------------
+    # Crawl 1 query batch
+    # -------------------------
+    def _crawl_with_query(self, query: str, *, from_str: str) -> int:
+        base_url = "https://newsapi.org/v2/everything"
+        saved = 0
+
+        for page in range(1, self.MAX_PAGES + 1):
+            if saved >= self.MAX_ARTICLES:
+                break
+
+            params = {
+                "q": query,
+                "language": self.LANGUAGE,
+                "sortBy": "publishedAt",
+                "pageSize": self.PAGE_SIZE,
+                "page": page,
+                "from": from_str,
+            }
+
+            try:
+                res = self._newsapi_get(base_url, params)
+                data = res.json()
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(f"  - NewsAPI 호출 실패(page={page}): {e}"))
+                continue
+
+            articles = data.get("articles", []) if isinstance(data, dict) else []
+            if not articles:
+                break
+
+            # 안전 최신순 정렬
+            articles.sort(key=lambda a: (a.get("publishedAt") or ""), reverse=True)
+
+            for a in articles:
+                if saved >= self.MAX_ARTICLES:
+                    break
+
+                title = (a.get("title") or "").strip()
+                url = (a.get("url") or "").strip()
+                if not title or not url:
+                    continue
+
+                img = a.get("urlToImage")
+                summary = (a.get("description") or title).strip()
+                content = (a.get("content") or "").strip() or None
+                pub_dt = self._parse_iso_dt(a.get("publishedAt"))
+
+                # source name
+                source_name = "NewsAPI"
+                src = a.get("source") or {}
+                if isinstance(src, dict):
+                    source_name = (src.get("name") or "").strip() or source_name
+
+                inc = self.save_article(
+                    title=title,
+                    summary=summary,
+                    link=url,
+                    image_url=img,
+                    source_name=source_name,
+                    content=content,
+                    published_at=pub_dt,
+                )
+                saved += inc
+
+            time.sleep(self.SLEEP_BETWEEN_PAGES)
+
+        return saved
+
+    # -------------------------
+    # Main
+    # -------------------------
+    def handle(self, *args, **kwargs):
+        if not getattr(settings, "OPENAI_API_KEY", None):
+            self.stdout.write(self.style.ERROR("settings.OPENAI_API_KEY 가 설정되어 있지 않습니다."))
+            return
+
+        keys = self._get_newsapi_keys()
+        if not keys:
+            self.stdout.write(self.style.ERROR("NEWSAPI 키가 없습니다. settings.NEWSAPI_KEYS 또는 settings.NEWSAPI_KEY 설정 필요"))
+            return
+
+        assert len(self.MASTER_TERMS) == 100, "MASTER_TERMS must be exactly 100"
+
+        self.stdout.write("=========================================")
+        self.stdout.write("🌍 International News Crawling (NewsAPI)")
+        self.stdout.write("- OpenAI embedding: ON (text-embedding-3-small)")
+        self.stdout.write("- LLM analyze(Lv1~Lv5 + theme): ON (analyze_news)")
+        self.stdout.write(f"- keys: {len(keys)}개 (자동 교체 활성화)")
+        self.stdout.write(f"- 이미지 필터: head_validate={self.VALIDATE_IMAGE_HEAD}")
+        self.stdout.write(
+            f"- lookback_days={self.DAYS_LOOKBACK}, page_size={self.PAGE_SIZE}, max_pages={self.MAX_PAGES}, max_articles={self.MAX_ARTICLES}"
+        )
+        self.stdout.write("=========================================")
+
+        from_dt_utc = timezone.now().astimezone(py_timezone.utc) - timedelta(days=self.DAYS_LOOKBACK)
+        from_str = from_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        queries = self._build_query_batches(chunk=10)
+
+        total_saved = 0
+        for idx, q in enumerate(queries, start=1):
+            if total_saved >= self.MAX_ARTICLES:
+                break
+
+            self.stdout.write(f"\n>>> Query batch {idx}/{len(queries)}")
+            saved = self._crawl_with_query(q, from_str=from_str)
+            total_saved += saved
+
+            if total_saved >= self.MAX_ARTICLES:
+                break
+
+            time.sleep(self.SLEEP_BETWEEN_BATCHES)
+
+        self.stdout.write("=========================================")
+        self.stdout.write(self.style.SUCCESS(f"✅ 완료: 신규 저장 {total_saved}건"))
+        self.stdout.write("=========================================")

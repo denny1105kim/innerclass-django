@@ -2,7 +2,7 @@ from rest_framework import serializers
 from .models import UserProfile
 
 class UserProfileSerializer(serializers.ModelSerializer):
-    assetType = serializers.CharField(source='asset_type', required=False, allow_null=True)
+    assetType = serializers.ListField(child=serializers.CharField(), source='asset_type', required=False)
     riskProfile = serializers.CharField(source='risk_profile', required=False, allow_null=True)
     knowledgeLevel = serializers.IntegerField(source='knowledge_level', required=False)
 

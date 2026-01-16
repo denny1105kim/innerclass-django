@@ -7,7 +7,7 @@ from pgvector.django import VectorField
 class NewsTheme(models.TextChoices):
     SEMICONDUCTOR_AI = "SEMICONDUCTOR_AI", "Semiconductor/AI"
     BATTERY = "BATTERY", "Battery"
-    GREEN_ENERGY = "GREEN_ENERGY", "Green Energy"
+    ENERGY = "ENERGY", "Energy"
     FINANCE_HOLDING = "FINANCE_HOLDING", "Finance/Holding"
     ICT_PLATFORM = "ICT_PLATFORM", "ICT/Platform"
     BIO_HEALTH = "BIO_HEALTH", "Bio/Health"
@@ -31,6 +31,8 @@ class NewsArticle(models.Model):
     market = models.CharField(max_length=50, choices=NewsMarket.choices)
     ticker = models.CharField(max_length=20, null=True, blank=True)
     sector = models.CharField(max_length=50, null=True, blank=True)
+    name = models.CharField(max_length=200, null=True, blank=True)
+
     theme = models.CharField(
         max_length=30,
         choices=NewsTheme.choices,

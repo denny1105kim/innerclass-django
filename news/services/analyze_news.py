@@ -2,25 +2,35 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import openai
 from django.conf import settings
 from django.db import transaction
 
+from markets.models import DailyRankingSnapshot, MarketChoices, RankingTypeChoices
 from news.models import NewsArticle, NewsArticleAnalysis, NewsTheme
 
 
 THEME_CHOICES = [
     "SEMICONDUCTOR_AI",
     "BATTERY",
-    "GREEN_ENERGY",
+    "ENERGY",
     "FINANCE_HOLDING",
     "ICT_PLATFORM",
     "BIO_HEALTH",
     "AUTO",
     "ETC",
 ]
+
+# ✅ 관련 종목 판단 임계치(이 점수 이상이면 ticker/sector/name 저장)
+RELATED_STOCK_MIN_CONFIDENCE = int(getattr(settings, "NEWS_RELATED_STOCK_MIN_CONFIDENCE", 70))
+
+# ✅ LLM에 넘길 종목 후보 최대 개수(너무 크면 토큰 낭비)
+MAX_CANDIDATES_FOR_LLM = int(getattr(settings, "NEWS_RELATED_STOCK_MAX_CANDIDATES", 40))
+
+# ✅ DB에서 후보를 가져올 때 시장별로 상위 N (시총 상위)
+TOPN_PER_MARKET = int(getattr(settings, "NEWS_RELATED_STOCK_TOPN_PER_MARKET", 120))
 
 
 def _strip_code_fences(text: str) -> str:
@@ -42,7 +52,7 @@ def _safe_theme(v: str) -> str:
     return vv if vv in allowed else NewsTheme.ETC
 
 
-# ✅ 추가: 레벨 라벨(초급자용/중급자용 등) prefix를 summary 등에서 제거
+# ✅ 레벨 라벨 prefix 제거
 _LEVEL_PREFIX_RE = re.compile(
     r"^\s*(?:주린이용|초보자용|중급자용|숙련자용|전문가용)\s*[:：\-]\s*",
     flags=re.IGNORECASE,
@@ -57,10 +67,6 @@ def _strip_level_prefix(s: str) -> str:
 
 
 def _clean_level_content_prefixes(level_content: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    level_content 내부에서 LLM이 가끔 넣는 '중급자용:' 같은 prefix를 깔끔히 제거.
-    요청대로: 다른 구조/필드는 건드리지 않고, 문자열 필드의 "앞부분 prefix"만 제거.
-    """
     if not isinstance(level_content, dict):
         return level_content
 
@@ -69,11 +75,9 @@ def _clean_level_content_prefixes(level_content: Dict[str, Any]) -> Dict[str, An
         if not isinstance(block, dict):
             continue
 
-        # summary에서 가장 흔하게 발생하므로 우선 적용
         if isinstance(block.get("summary"), str):
             block["summary"] = _strip_level_prefix(block["summary"])
 
-        # 혹시 bullet_points / what_is_this / why_important 같은 리스트 첫 토큰에도 붙는 경우 대비 (prefix만 제거)
         for list_field in ("bullet_points", "what_is_this", "why_important"):
             v = block.get(list_field)
             if isinstance(v, list):
@@ -90,11 +94,9 @@ def _clean_level_content_prefixes(level_content: Dict[str, Any]) -> Dict[str, An
                 if changed:
                     block[list_field] = new_list
 
-        # action_guide에도 붙는 경우 대비
         if isinstance(block.get("action_guide"), str):
             block["action_guide"] = _strip_level_prefix(block["action_guide"])
 
-        # strategy_guide 내부에도 붙는 경우 대비
         sg = block.get("strategy_guide")
         if isinstance(sg, dict):
             if isinstance(sg.get("short_term"), str):
@@ -108,33 +110,411 @@ def _clean_level_content_prefixes(level_content: Dict[str, Any]) -> Dict[str, An
 
 
 def _build_level_payload(full: Dict[str, Any], level_key: str) -> Dict[str, Any]:
-    """
-    full 결과에서 공통(meta) + 특정 레벨(level_content[level_key])를 합쳐서
-    해당 레벨 row에 저장하기 좋은 JSON으로 만든다.
-    """
     common = {
         "deep_analysis_reasoning": full.get("deep_analysis_reasoning", ""),
         "theme": full.get("theme", NewsTheme.ETC),
         "keywords": full.get("keywords", []),
         "sentiment_score": full.get("sentiment_score", None),
         "vocabulary": full.get("vocabulary", []),
+        # ✅ 종목 판단 결과를 분석 JSON에도 포함
+        "related_stock": full.get("related_stock", None),
     }
     level_content = (full.get("level_content") or {}).get(level_key) or {}
     if not isinstance(level_content, dict):
         level_content = {}
-
     merged = dict(common)
     merged.update(level_content)
     return merged
 
 
+# =========================================================
+# Title translation (한글 없으면 "요약형 헤드라인"으로 번역 후 title 저장)
+# =========================================================
+def _has_hangul(text: str) -> bool:
+    text = text or ""
+    for ch in text:
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7A3:
+            return True
+        if 0x1100 <= code <= 0x11FF:
+            return True
+        if 0x3130 <= code <= 0x318F:
+            return True
+    return False
+
+
+# ✅ "~다/~했다" 종결 제거용(마지막에 붙는 경우만 최소 제거)
+_TRAILING_DECLARATIVE_RE = re.compile(r"(?:\s*)(했다|하였다|한다|됐다|되었다|된다|밝혔다|말했다|전했다|예상했다|추정했다)\s*$")
+
+
+def _postprocess_ko_headline(title_ko: str) -> str:
+    """
+    헤드라인 스타일로 보이도록 후처리:
+    - 끝의 '~다/~했다' 류 종결이 붙으면 제거(강제는 아님, 최소 적용)
+    - 불필요한 따옴표/공백 정리
+    """
+    t = (title_ko or "").strip()
+
+    # 쌍따옴표로 둘러싸인 경우 제거
+    if len(t) >= 2 and ((t[0] == '"' and t[-1] == '"') or (t[0] == "“" and t[-1] == "”")):
+        t = t[1:-1].strip()
+
+    # 문장형 종결 제거(있을 때만)
+    t2 = _TRAILING_DECLARATIVE_RE.sub("", t).strip()
+    if t2:
+        t = t2
+
+    # 맨 끝 마침표 제거(있을 때만)
+    if t.endswith("."):
+        t = t[:-1].strip()
+
+    # 중복 공백 정리
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _translate_title_to_ko(title: str) -> Optional[str]:
+    """
+    목표: '뉴스 제목 번역 적용' 같은 "요약형 헤드라인" 톤
+    - 문장 종결(~다/~했다) 지양
+    - 헤드라인 관용(“…”, ‘…’) 최소화
+    - 고유명사/티커/숫자 보존
+    """
+    title = (title or "").strip()
+    if not title:
+        return None
+
+    client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+
+    prompt = (
+        "너는 경제/금융 뉴스 데스크의 헤드라인 에디터다.\n"
+        "아래 '영문/비한글 제목'을 한국어 헤드라인으로 번역하라.\n\n"
+        "[핵심 톤]\n"
+        "- 문장형 종결(예: ~다, ~했다) 금지. '요약형 헤드라인'으로 작성.\n"
+        "- 불필요한 따옴표/수식어 최소화, 정보 밀도 높게.\n\n"
+        "[보존 규칙]\n"
+        "- 고유명사(기업/인물/제품), 티커, 숫자, 단위는 가능한 원문을 유지.\n"
+        "- 의미를 바꾸는 의역/요약 금지. 제목의 의미를 그대로 옮기되 헤드라인 문체로만 변환.\n\n"
+        "[출력]\n"
+        "- 반드시 JSON만 출력\n"
+        '- 형식: {"ko_title": "..."}\n\n'
+        f'원문 제목: "{title}"'
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a Korean financial headline editor. Output JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=200,
+    )
+
+    text = _strip_code_fences((resp.choices[0].message.content or "").strip())
+    try:
+        data = json.loads(text)
+        ko = (data.get("ko_title") or "").strip()
+        ko = _postprocess_ko_headline(ko)
+        return ko or None
+    except Exception:
+        return None
+
+
+def _maybe_translate_and_save_title(article: NewsArticle) -> bool:
+    title = (article.title or "").strip()
+    if not title:
+        return False
+    if _has_hangul(title):
+        return False
+
+    ko = _translate_title_to_ko(title)
+    if not ko or ko == title:
+        return False
+
+    article.title = ko
+    article.save(update_fields=["title"])
+    return True
+
+
+# =========================================================
+# Related stock detection (DailyRankingSnapshot 기반)
+# =========================================================
+def _normalize_for_match(s: str) -> str:
+    s = (s or "").lower()
+    # 공백/특수문자 정리(너무 공격적으로 하면 한글 매칭 깨질 수 있어 최소화)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _resolve_latest_asof_date_for_market(market: str) -> Optional[Any]:
+    return (
+        DailyRankingSnapshot.objects.filter(market=market)
+        .order_by("-asof_date")
+        .values_list("asof_date", flat=True)
+        .first()
+    )
+
+
+def _fetch_top_ranked_stocks(market: str, topn: int) -> List[DailyRankingSnapshot]:
+    """
+    시장별 최신 asof_date 기준, 시총(MARKET_CAP) 랭킹 상위 topn을 가져옴.
+    """
+    asof = _resolve_latest_asof_date_for_market(market)
+    if not asof:
+        return []
+
+    return list(
+        DailyRankingSnapshot.objects.filter(
+            market=market,
+            asof_date=asof,
+            ranking_type=RankingTypeChoices.MARKET_CAP,
+        )
+        .order_by("rank")[: max(1, topn)]
+    )
+
+
+def _build_candidate_universe_for_article(article: NewsArticle) -> List[Dict[str, str]]:
+    """
+    기사 market에 따라 후보 universe를 구성:
+    - Korea -> KOSPI + KOSDAQ
+    - International -> NASDAQ
+    """
+    if article.market == "Korea":
+        markets = [MarketChoices.KOSPI, MarketChoices.KOSDAQ]
+    else:
+        markets = [MarketChoices.NASDAQ]
+
+    rows: List[DailyRankingSnapshot] = []
+    for m in markets:
+        rows.extend(_fetch_top_ranked_stocks(m, TOPN_PER_MARKET))
+
+    # dedup by symbol_code (가장 먼저 나온 row 유지)
+    seen = set()
+    out: List[Dict[str, str]] = []
+    for r in rows:
+        if r.symbol_code in seen:
+            continue
+        seen.add(r.symbol_code)
+        out.append(
+            {
+                "ticker": r.symbol_code,
+                "name": r.name,
+                "sector": r.market,  # ✅ sector에 KOSPI/KOSDAQ/NASDAQ 저장
+            }
+        )
+    return out
+
+
+def _shortlist_candidates_by_text(article: NewsArticle, universe: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    1차로 문자열 포함 매칭으로 후보를 줄임(토큰 절약).
+    - 기사 텍스트(제목+요약+본문 일부)에 name이 포함되면 우선 선발
+    - 부족하면 앞쪽(시총상위)에서 채움
+    """
+    text = " ".join(
+        [
+            (article.title or ""),
+            (article.summary or ""),
+            (article.content or "")[: 2000],
+        ]
+    )
+    text_n = _normalize_for_match(text)
+
+    hits: List[Dict[str, str]] = []
+    for c in universe:
+        nm = _normalize_for_match(c.get("name", ""))
+        tk = _normalize_for_match(c.get("ticker", ""))
+
+        # 이름이 본문/제목에 들어가면 강력 후보
+        if nm and nm in text_n:
+            hits.append(c)
+            continue
+
+        # 티커가 그대로 기사에 들어오는 경우(예: AAPL, 005930 등)
+        if tk and tk in text_n:
+            hits.append(c)
+            continue
+
+    # dedup + limit
+    seen = set()
+    uniq_hits: List[Dict[str, str]] = []
+    for c in hits:
+        k = c["ticker"]
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq_hits.append(c)
+
+    if len(uniq_hits) >= MAX_CANDIDATES_FOR_LLM:
+        return uniq_hits[:MAX_CANDIDATES_FOR_LLM]
+
+    # 부족하면 universe에서 채움(시총상위 우선)
+    for c in universe:
+        if c["ticker"] in seen:
+            continue
+        uniq_hits.append(c)
+        seen.add(c["ticker"])
+        if len(uniq_hits) >= MAX_CANDIDATES_FOR_LLM:
+            break
+
+    return uniq_hits
+
+
+def _detect_related_stock_with_llm(
+    article: NewsArticle,
+    candidates: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    """
+    LLM으로 "이 뉴스가 후보 종목들 중 어느 종목과 가장 관련있는지" 판단.
+    - 없으면 null
+    - 있으면 ticker/sector/name/confidence 반환
+    """
+    client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+
+    cand_json = json.dumps(candidates, ensure_ascii=False)
+
+    content_to_analyze = (article.content or "").strip() or (article.summary or "").strip()
+    content_to_analyze = content_to_analyze[:6000]
+
+    prompt = f"""아래 뉴스가 "아래 후보 종목들" 중 특정 종목과 실질적으로 관련(기업 자체/실적/사업/주가 촉매/규제/계약/공급망/경쟁 등) 있는지 판단해.
+관련이 있으면 가장 관련성이 높은 종목 1개를 고르고, 없으면 null로 답해.
+
+[뉴스]
+제목: {article.title}
+요약: {article.summary}
+본문: {content_to_analyze}
+
+[후보 종목들(JSON)]
+{cand_json}
+
+[출력 규칙]
+- 반드시 JSON만 출력
+- 관련이 없으면:
+  {{"related": false, "ticker": null, "sector": null, "confidence": 0, "reason": "..." }}
+- 관련이 있으면:
+  {{"related": true, "ticker": "<후보 ticker>", "sector": "<후보 sector>", "confidence": 0~100 정수, "reason": "근거(짧게)" }}
+- 후보에 없는 ticker/sector를 만들어내면 안 된다.
+"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a strict financial entity linker. Output JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=350,
+    )
+
+    text = _strip_code_fences((resp.choices[0].message.content or "").strip())
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("not a dict")
+
+        related = bool(data.get("related"))
+        ticker = data.get("ticker")
+        sector = data.get("sector")
+        conf = data.get("confidence", 0)
+        try:
+            conf = int(conf)
+        except Exception:
+            conf = 0
+        conf = max(0, min(100, conf))
+        reason = str(data.get("reason") or "").strip()
+
+        name: Optional[str] = None
+
+        if related:
+            allowed = {(c["ticker"], c["sector"]) for c in candidates}
+            if (ticker, sector) not in allowed:
+                return {
+                    "related": False,
+                    "ticker": None,
+                    "sector": None,
+                    "name": None,
+                    "confidence": 0,
+                    "reason": "invalid-candidate",
+                }
+
+            # ✅ ticker/sector로 candidates에서 name 역조회해서 반환
+            for c in candidates:
+                if c.get("ticker") == ticker and c.get("sector") == sector:
+                    name = c.get("name")
+                    break
+
+        return {
+            "related": related,
+            "ticker": ticker,
+            "sector": sector,
+            "name": name,
+            "confidence": conf,
+            "reason": reason,
+        }
+
+    except Exception:
+        return {
+            "related": False,
+            "ticker": None,
+            "sector": None,
+            "name": None,
+            "confidence": 0,
+            "reason": "parse-fail",
+        }
+
+
+def _maybe_set_ticker_sector(article: NewsArticle) -> Dict[str, Any]:
+    """
+    DailyRankingSnapshot 기반 후보를 만들고 LLM으로 연결한 뒤,
+    임계치 이상이면 article.ticker/sector/name에 저장.
+    """
+    universe = _build_candidate_universe_for_article(article)
+    if not universe:
+        return {"related": False, "ticker": None, "sector": None, "name": None, "confidence": 0, "reason": "no-universe"}
+
+    shortlist = _shortlist_candidates_by_text(article, universe)
+    res = _detect_related_stock_with_llm(article, shortlist)
+
+    if res.get("related") and int(res.get("confidence") or 0) >= RELATED_STOCK_MIN_CONFIDENCE:
+        ticker = res.get("ticker")
+        sector = res.get("sector")
+        name = res.get("name")
+        if ticker and sector:
+            article.ticker = str(ticker)
+            article.sector = str(sector)  # ✅ KOSPI/KOSDAQ/NASDAQ 저장
+            article.name = (str(name).strip() if name else None)  # ✅ 종목명 저장
+            article.save(update_fields=["ticker", "sector", "name"])
+    return res
+
+
+# =========================================================
+# Main
+# =========================================================
 def analyze_news(article: NewsArticle, save_to_db: bool = True) -> Optional[Dict[str, Any]]:
     """
-    기사 객체를 받아 LLM 분석을 수행하고 결과를 반환합니다.
     save_to_db=True일 경우:
-      - NewsArticle.theme 를 Lv1 기반 theme으로 저장
-      - NewsArticleAnalysis에 Lv1~Lv5 row를 각각 upsert
+      - title이 한글이 아니면 "요약형 헤드라인"으로 번역 후 article.title 저장
+      - 관련 종목(ticker/sector/name)을 DailyRankingSnapshot 기반으로 판단 후 저장(신뢰도 임계치 이상)
+      - theme 저장
+      - NewsArticleAnalysis Lv1~Lv5 upsert
     """
+    related_res: Optional[Dict[str, Any]] = None
+
+    if save_to_db:
+        # 1) 제목 번역(헤드라인 톤)
+        try:
+            _maybe_translate_and_save_title(article)
+        except Exception as e:
+            print(f"WARN: title translation failed (id={getattr(article, 'id', None)}): {e}")
+
+        # 2) 종목 연결(실패해도 전체 분석은 진행)
+        try:
+            related_res = _maybe_set_ticker_sector(article)
+        except Exception as e:
+            print(f"WARN: related-stock detection failed (id={getattr(article, 'id', None)}): {e}")
+            related_res = None
+
     content_to_analyze = (article.content or "").strip() or (article.summary or "").strip()
     if not content_to_analyze:
         return None
@@ -142,8 +522,7 @@ def analyze_news(article: NewsArticle, save_to_db: bool = True) -> Optional[Dict
     try:
         client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
 
-        # ====== 원본 프롬프트 유지 + theme 분류만 추가 ======
-        prompt = f"""다음 뉴스 기사를 심층 분석하여 아래 형식의 JSON으로 응답해줘. 
+        prompt = f"""다음 뉴스 기사를 심층 분석하여 아래 형식의 JSON으로 응답해줘.
 다른 말은 덧붙이지 말고 반드시 JSON 데이터만 출력해.
 
 [기사 정보]
@@ -155,7 +534,7 @@ def analyze_news(article: NewsArticle, save_to_db: bool = True) -> Optional[Dict
 {THEME_CHOICES}
 - 반도체/AI/칩/파운드리/HBM/GPU/데이터센터/LLM 인프라 중심이면 SEMICONDUCTOR_AI
 - 배터리/리튬/양극재/전해질/2차전지 밸류체인이면 BATTERY
-- 재생에너지/탄소중립/수소/태양광/풍력/정책이면 GREEN_ENERGY
+- 석유에너지/오일에너지/방사능/원자력발전소/재생에너지/탄소중립/수소/태양광/풍력/정책이면 ENERGY
 - 은행/증권/보험/금융지주/금리/대출/예대마진이면 FINANCE_HOLDING
 - 플랫폼/클라우드/SaaS/인터넷/ICT 서비스면 ICT_PLATFORM
 - 바이오/제약/헬스케어/임상/FDA면 BIO_HEALTH
@@ -250,34 +629,38 @@ def analyze_news(article: NewsArticle, save_to_db: bool = True) -> Optional[Dict
             }},
             "action_guide": "기관 투자자급의 High-Level 전략 (Long/Short, Arbitrage 등)"
         }}
-    }}
+  }}
 }}
 
 [작성 지침]
 1. 'deep_analysis_reasoning'을 가장 먼저 작성하여 깊이 있는 분석을 선행할 것.
-2. 각 레벨(lv1~lv5)별로 어조(Tone & Manner)와 내용의 깊이(Depth)를 명확히 차별화할 것. 똑같은 내용을 말만 바꾸지 말고, *관점* 자체를 다르게 가져갈 것.
-3. Lv1은 아주 쉽고 친절하게, Lv5는 매우 전문적이고 냉철하게 작성할 것.
-4. 감정 점수(sentiment_score)는 0(매우 부정)~100(매우 긍정) 사이의 정수.
+2. 각 레벨(lv1~lv5)별로 어조와 깊이를 명확히 차별화할 것.
+3. Lv1은 아주 쉽게, Lv5는 매우 전문적으로 작성할 것.
+4. sentiment_score는 0~100 정수.
 """
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "당신은 월스트리트의 수석 애널리스트이자, 동시에 친절한 금융 교육자입니다. JSON만 출력하세요."},
+                {
+                    "role": "system",
+                    "content": "당신은 월스트리트의 수석 애널리스트이자, 동시에 친절한 금융 교육자입니다. JSON만 출력하세요.",
+                },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
             max_tokens=3000,
         )
 
-        result_text = (response.choices[0].message.content or "").strip()
-        result_text = _strip_code_fences(result_text)
-
+        result_text = _strip_code_fences((response.choices[0].message.content or "").strip())
         full = json.loads(result_text)
 
-        # theme 보정
         theme = _safe_theme(str(full.get("theme", "")))
         full["theme"] = theme
+
+        # ✅ related_stock 결과를 full에도 포함 (분석 JSON에서 사용 가능)
+        if related_res:
+            full["related_stock"] = related_res
 
         level_content = full.get("level_content")
         if isinstance(level_content, dict):
@@ -285,19 +668,13 @@ def analyze_news(article: NewsArticle, save_to_db: bool = True) -> Optional[Dict
 
         if save_to_db:
             with transaction.atomic():
-                # 대표 theme은 Lv1이 정한 theme으로 NewsArticle에 저장
+                # ✅ theme 저장
                 if article.theme != theme:
                     article.theme = theme
                     article.save(update_fields=["theme"])
 
-                # Lv1~Lv5 각각 row 저장
-                level_map = {
-                    1: "lv1",
-                    2: "lv2",
-                    3: "lv3",
-                    4: "lv4",
-                    5: "lv5",
-                }
+                # ✅ Lv1~Lv5 저장
+                level_map = {1: "lv1", 2: "lv2", 3: "lv3", 4: "lv4", 5: "lv5"}
                 for level, key in level_map.items():
                     payload = _build_level_payload(full, key)
                     NewsArticleAnalysis.objects.update_or_create(

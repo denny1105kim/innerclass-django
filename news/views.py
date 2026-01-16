@@ -28,7 +28,7 @@ def _clamp_level(x: int) -> int:
     try:
         x = int(x)
     except Exception:
-        return 1
+        return 3
     return max(1, min(5, x))
 
 
@@ -60,7 +60,7 @@ def _get_user_level(request) -> int:
     profile = _get_user_profile(request)
     if profile and hasattr(profile, "knowledge_level"):
         return _clamp_level(profile.knowledge_level)
-    return 1
+    return 3
 
 
 def _build_news_list_payload(*, request, qs, user_level: int, limit: int):
@@ -152,7 +152,6 @@ class ThemeNewsView(APIView):
     def get(self, request):
         theme = (request.query_params.get("theme") or "").strip()
         if theme not in dict(NewsTheme.choices):
-            # theme이 비었거나 잘못된 경우: ETC로 fallback
             theme = NewsTheme.ETC
 
         market_filter = (request.query_params.get("market") or "all").strip().lower()

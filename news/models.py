@@ -23,7 +23,7 @@ class NewsMarket(models.TextChoices):
 class NewsArticle(models.Model):
     title = models.CharField(max_length=500)
     summary = models.TextField()
-    content = models.TextField(null=True, blank=True)  # 원문(가능하면)
+    content = models.TextField(null=True, blank=True) 
     url = models.URLField(max_length=1000, unique=True)
     image_url = models.URLField(max_length=1000, null=True, blank=True)
     published_at = models.DateTimeField(db_index=True)
@@ -31,8 +31,6 @@ class NewsArticle(models.Model):
     market = models.CharField(max_length=50, choices=NewsMarket.choices)
     ticker = models.CharField(max_length=20, null=True, blank=True)
     sector = models.CharField(max_length=50, null=True, blank=True)
-
-    # 대표 theme(리스트 필터/정렬용) - Lv1 분석으로 채움
     theme = models.CharField(
         max_length=30,
         choices=NewsTheme.choices,

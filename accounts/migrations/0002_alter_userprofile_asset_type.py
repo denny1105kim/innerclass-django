@@ -7,13 +7,46 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('accounts', '0001_initial'),
+        ("accounts", "0001_initial"),
     ]
 
     operations = [
+        # 1) 기존 단일 문자열(text/varchar)을 1원소 배열로 변환하며 타입을 배열로 변경
+        #    - NULL/빈문자열 -> 빈 배열
+        migrations.RunSQL(
+            sql=r"""
+                ALTER TABLE accounts_userprofile
+                ALTER COLUMN asset_type
+                TYPE varchar(50)[]
+                USING (
+                    CASE
+                        WHEN asset_type IS NULL OR asset_type = '' THEN ARRAY[]::varchar(50)[]
+                        ELSE ARRAY[asset_type]::varchar(50)[]
+                    END
+                );
+            """,
+            reverse_sql=r"""
+                ALTER TABLE accounts_userprofile
+                ALTER COLUMN asset_type
+                TYPE varchar(50)
+                USING (
+                    CASE
+                        WHEN asset_type IS NULL THEN NULL
+                        WHEN array_length(asset_type, 1) >= 1 THEN asset_type[1]
+                        ELSE NULL
+                    END
+                );
+            """,
+        ),
+
+        # 2) Django state를 ArrayField로 맞춤(실제 모델 필드와 동일해야 함)
         migrations.AlterField(
-            model_name='userprofile',
-            name='asset_type',
-            field=django.contrib.postgres.fields.ArrayField(base_field=models.CharField(max_length=50), blank=True, default=list),
+            model_name="userprofile",
+            name="asset_type",
+            field=django.contrib.postgres.fields.ArrayField(
+                base_field=models.CharField(max_length=50),
+                blank=True,
+                default=list,
+            ),
         ),
     ]

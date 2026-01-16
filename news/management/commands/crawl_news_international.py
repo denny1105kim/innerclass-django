@@ -67,7 +67,16 @@ class Command(BaseCommand):
     MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB
 
     # -------------------------
-    # MASTER TERMS (100
+    # Source filtering
+    # -------------------------
+    # ✅ thefly.com은 이미지 품질 이슈로 제외
+    BLOCKED_DOMAINS = {
+        "thefly.com",
+        "www.thefly.com",
+    }
+
+    # -------------------------
+    # MASTER TERMS (100)
     # -------------------------
     MASTER_TERMS = [
         # AI / Semicon (25)
@@ -310,6 +319,38 @@ class Command(BaseCommand):
         return False
 
     # -------------------------
+    # Source filtering
+    # -------------------------
+    def _is_blocked_source(self, url: str, source_name: str) -> bool:
+        """
+        thefly.com 차단.
+        - URL 도메인 기준
+        - source_name(NewsAPI source.name)에도 혹시 포함되면 차단
+        """
+        u = (url or "").strip().lower()
+        sn = (source_name or "").strip().lower()
+
+        try:
+            host = (urlparse(u).netloc or "").lower()
+        except Exception:
+            host = ""
+
+        if host in self.BLOCKED_DOMAINS:
+            return True
+
+        # host가 없거나 변형된 케이스 대비 (subdomain 포함)
+        if host and any(host == d or host.endswith("." + d.lstrip("www.")) for d in self.BLOCKED_DOMAINS):
+            return True
+
+        if "thefly.com" in u:
+            return True
+        if "thefly" in sn:
+            # source_name이 "The Fly" 등으로 오는 경우 방어적 차단
+            return True
+
+        return False
+
+    # -------------------------
     # Image checks
     # -------------------------
     def _looks_like_bad_image_url(self, image_url: str) -> bool:
@@ -431,6 +472,11 @@ class Command(BaseCommand):
         if not title_n or not link_n:
             return 0
 
+        # ✅ thefly.com 차단
+        if self._is_blocked_source(link_n, source_name):
+            self.stdout.write(f"  - [{source_name}] (blocked: thefly) {title_n[:60]}... -> skip")
+            return 0
+
         if self._is_duplicate(title_n, link_n):
             self.stdout.write(f"  - [{source_name}] (중복) {title_n[:60]}...")
             return 0
@@ -461,7 +507,6 @@ class Command(BaseCommand):
                     published_at=pub_utc,
                     sector="금융/경제",
                     ticker=None,
-
                     embedding=vector,
                 )
                 analyze_news(article, save_to_db=True)
@@ -516,16 +561,21 @@ class Command(BaseCommand):
                 if not title or not url:
                     continue
 
-                img = a.get("urlToImage")
-                summary = (a.get("description") or title).strip()
-                content = (a.get("content") or "").strip() or None
-                pub_dt = self._parse_iso_dt(a.get("publishedAt"))
-
                 # source name
                 source_name = "NewsAPI"
                 src = a.get("source") or {}
                 if isinstance(src, dict):
                     source_name = (src.get("name") or "").strip() or source_name
+
+                # ✅ thefly.com 차단 (가능한 빨리 거르기: 불필요한 이미지/임베딩/LLM 비용 방지)
+                if self._is_blocked_source(url, source_name):
+                    self.stdout.write(f"  - [{source_name}] (blocked: thefly) {title[:60]}... -> skip")
+                    continue
+
+                img = a.get("urlToImage")
+                summary = (a.get("description") or title).strip()
+                content = (a.get("content") or "").strip() or None
+                pub_dt = self._parse_iso_dt(a.get("publishedAt"))
 
                 inc = self.save_article(
                     title=title,
@@ -552,7 +602,9 @@ class Command(BaseCommand):
 
         keys = self._get_newsapi_keys()
         if not keys:
-            self.stdout.write(self.style.ERROR("NEWSAPI 키가 없습니다. settings.NEWSAPI_KEYS 또는 settings.NEWSAPI_KEY 설정 필요"))
+            self.stdout.write(
+                self.style.ERROR("NEWSAPI 키가 없습니다. settings.NEWSAPI_KEYS 또는 settings.NEWSAPI_KEY 설정 필요")
+            )
             return
 
         assert len(self.MASTER_TERMS) == 100, "MASTER_TERMS must be exactly 100"
@@ -563,6 +615,7 @@ class Command(BaseCommand):
         self.stdout.write("- LLM analyze(Lv1~Lv5 + theme): ON (analyze_news)")
         self.stdout.write(f"- keys: {len(keys)}개 (자동 교체 활성화)")
         self.stdout.write(f"- 이미지 필터: head_validate={self.VALIDATE_IMAGE_HEAD}")
+        self.stdout.write(f"- blocked_domains: {', '.join(sorted(self.BLOCKED_DOMAINS))}")
         self.stdout.write(
             f"- lookback_days={self.DAYS_LOOKBACK}, page_size={self.PAGE_SIZE}, max_pages={self.MAX_PAGES}, max_articles={self.MAX_ARTICLES}"
         )

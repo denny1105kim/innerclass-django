@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, Optional
 
 import openai
@@ -39,6 +40,71 @@ def _safe_theme(v: str) -> str:
     vv = (v or "").strip().upper()
     allowed = {x for x, _ in NewsTheme.choices}
     return vv if vv in allowed else NewsTheme.ETC
+
+
+# ✅ 추가: 레벨 라벨(초급자용/중급자용 등) prefix를 summary 등에서 제거
+_LEVEL_PREFIX_RE = re.compile(
+    r"^\s*(?:주린이용|초보자용|중급자용|숙련자용|전문가용)\s*[:：\-]\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_level_prefix(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    return _LEVEL_PREFIX_RE.sub("", s).strip()
+
+
+def _clean_level_content_prefixes(level_content: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    level_content 내부에서 LLM이 가끔 넣는 '중급자용:' 같은 prefix를 깔끔히 제거.
+    요청대로: 다른 구조/필드는 건드리지 않고, 문자열 필드의 "앞부분 prefix"만 제거.
+    """
+    if not isinstance(level_content, dict):
+        return level_content
+
+    for lv_key in ("lv1", "lv2", "lv3", "lv4", "lv5"):
+        block = level_content.get(lv_key)
+        if not isinstance(block, dict):
+            continue
+
+        # summary에서 가장 흔하게 발생하므로 우선 적용
+        if isinstance(block.get("summary"), str):
+            block["summary"] = _strip_level_prefix(block["summary"])
+
+        # 혹시 bullet_points / what_is_this / why_important 같은 리스트 첫 토큰에도 붙는 경우 대비 (prefix만 제거)
+        for list_field in ("bullet_points", "what_is_this", "why_important"):
+            v = block.get(list_field)
+            if isinstance(v, list):
+                new_list = []
+                changed = False
+                for item in v:
+                    if isinstance(item, str):
+                        cleaned = _strip_level_prefix(item)
+                        if cleaned != item:
+                            changed = True
+                        new_list.append(cleaned)
+                    else:
+                        new_list.append(item)
+                if changed:
+                    block[list_field] = new_list
+
+        # action_guide에도 붙는 경우 대비
+        if isinstance(block.get("action_guide"), str):
+            block["action_guide"] = _strip_level_prefix(block["action_guide"])
+
+        # strategy_guide 내부에도 붙는 경우 대비
+        sg = block.get("strategy_guide")
+        if isinstance(sg, dict):
+            if isinstance(sg.get("short_term"), str):
+                sg["short_term"] = _strip_level_prefix(sg["short_term"])
+            if isinstance(sg.get("long_term"), str):
+                sg["long_term"] = _strip_level_prefix(sg["long_term"])
+
+        level_content[lv_key] = block
+
+    return level_content
 
 
 def _build_level_payload(full: Dict[str, Any], level_key: str) -> Dict[str, Any]:
@@ -212,6 +278,10 @@ def analyze_news(article: NewsArticle, save_to_db: bool = True) -> Optional[Dict
         # theme 보정
         theme = _safe_theme(str(full.get("theme", "")))
         full["theme"] = theme
+
+        level_content = full.get("level_content")
+        if isinstance(level_content, dict):
+            full["level_content"] = _clean_level_content_prefixes(level_content)
 
         if save_to_db:
             with transaction.atomic():

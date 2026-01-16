@@ -23,23 +23,20 @@ from main.services.gemini_client import get_gemini_client, ChatMessage
 # Config
 # =========================================================
 KEYWORD_LIMIT = 3
-
 NEWS_LIMIT = 15
-
 CANDIDATE_POOL_LIMIT = 100
-
 BATCH_SIZE = 25
-
 MAX_REFILL_ATTEMPTS = 10
 
 REQUEST_TIMEOUT = 8.0
 KST = ZoneInfo("Asia/Seoul")
 
 MAX_AGE_DAYS = 4
-
 CONTENT_MAX_CHARS = 6000
-
 MIN_ARTICLE_TEXT_CHARS = 180
+
+# Trend generation retry (to avoid N/A keywords)
+MAX_TREND_RETRY_ATTEMPTS = 6
 
 BLOCKED_DOMAINS = {
     "example.com",
@@ -74,7 +71,7 @@ Google Search(실시간 검색)를 반드시 활용하여 최신 정보를 바�
 {{
   "items": [
     {{
-      "keyword": "키워드(5글자이내)",
+      "keyword": "키워드(공백 포함 최대 5글자, N/A 금지)",
       "reason": "선정 이유(2문장 이내, 리스크 1개 포함)",
       "news": [
         {{
@@ -91,7 +88,7 @@ Google Search(실시간 검색)를 반드시 활용하여 최신 정보를 바�
 
 [절대 규칙]
 - items 개수는 정확히 {KEYWORD_LIMIT}개.
-- keyword는 공백 포함 최대 5글자(또는 매우 짧게).
+- keyword는 공백 포함 최대 5글자(또는 매우 짧게). "N/A", "없음", "데이터" 같은 무의미 값 금지.
 - news는 각 키워드당 최소 {BATCH_SIZE}개 이상을 제공하려고 노력해라(부족하면 최대한).
 - news의 link는 반드시 가져와서 요약한 실제 기사 URL이어야 한다.
   - example.com 같은 placeholder 금지
@@ -101,6 +98,9 @@ Google Search(실시간 검색)를 반드시 활용하여 최신 정보를 바�
 [최신성 강제]
 - news는 "오늘(KST) 또는 최근 {MAX_AGE_DAYS}일 이내(KST)" 기사만 허용한다. (그 이전 금지)
 - 부족하면 다른 매체의 최신 기사로 다시 찾아 채워라.
+
+[실패 처리]
+- keyword 또는 news가 비어있거나 규칙을 위반하면, 너 스스로 Google Search를 다시 해서 규칙을 만족할 때까지 재구성해라.
 """.strip()
 
 
@@ -116,6 +116,7 @@ def _build_user_msg(scope: str, now_kst: datetime) -> str:
         f"조건: 반드시 오늘 또는 최근 {MAX_AGE_DAYS}일 이내(KST) 기사만 사용.\n"
         "조건: link는 실제 기사 URL만. example.com/vertexaisearch 등 금지.\n"
         "조건: published_at은 YYYY-MM-DD HH:MM(KST)로 출력.\n"
+        "조건: keyword는 최대 5글자, N/A 금지.\n"
     )
 
     if scope == TrendScope.KR:
@@ -129,6 +130,19 @@ def _build_user_msg(scope: str, now_kst: datetime) -> str:
 대상 시장: {target}
 요청 사항: {ratio}
 각 키워드마다 관련 최신 뉴스 목록을 최대한 많이(최소 {BATCH_SIZE}개 목표) 채워라.
+""".strip()
+
+
+def _build_user_retry_msg(scope: str, now_kst: datetime, bad_keywords: Iterable[str]) -> str:
+    bad = [k for k in (bad_keywords or []) if (k or "").strip()]
+    bad_lines = "\n".join(f"- {k}" for k in bad[:20])
+    return f"""{_build_user_msg(scope, now_kst)}
+
+[재시도 지시]
+- 이전 응답에 부적절한 keyword가 있었다. 아래 keyword는 사용 금지:
+{bad_lines if bad_lines else "(없음)"}
+- items {KEYWORD_LIMIT}개를 모두 유효한 keyword(최대 5글자)로 채워라.
+- "N/A", "없음", "데이터 없음" 같은 값은 절대 쓰지 마라.
 """.strip()
 
 
@@ -199,11 +213,29 @@ def _safe_json_load(s: str) -> dict:
         return {}
 
 
+_BAD_KEYWORDS = {"n/a", "na", "none", "null", "없음", "데이터", "데이터없음", "데이터 없음"}
+
+
 def _sanitize_keyword(s: Any) -> str:
     kw = str(s or "").strip()
-    if len(kw) > 7:
-        kw = kw[:7]
+    kw = re.sub(r"\s+", " ", kw).strip()
+    if len(kw) > 5:
+        kw = kw[:5]
     return kw
+
+
+def _is_valid_keyword(kw: str) -> bool:
+    t = (kw or "").strip()
+    if not t:
+        return False
+    low = t.lower().strip()
+    if low in _BAD_KEYWORDS:
+        return False
+    if "n/a" in low:
+        return False
+    if t in {"N/A", "NA"}:
+        return False
+    return True
 
 
 def _sanitize_text(s: Any, limit: int) -> str:
@@ -218,12 +250,6 @@ _TITLE_TRIM_SUFFIX = re.compile(r"\s*[-–—]\s*[^-–—]{1,25}\s*$")  # 끝�
 
 
 def _normalize_title(title: str) -> str:
-    """
-    제목 기반 중복 제거용 정규화:
-    - [속보], (종합) 같은 prefix 제거
-    - 끝의 "- 조선일보" 같은 suffix 제거(대략적인 휴리스틱)
-    - 공백 정리, 소문자화
-    """
     t = (title or "").strip()
     if not t:
         return ""
@@ -257,7 +283,6 @@ def _is_blocked_url(url: str) -> bool:
 
 _REDIRECT_PARAM_KEYS = ("url", "u", "q", "target", "dest", "destination", "redirect", "redir")
 
-# 섹션/목록/메인/랭킹 페이지로 자주 보이는 path 키워드(도메인 공통 휴리스틱)
 _NON_ARTICLE_PATH_HINTS = (
     "/index",
     "/main",
@@ -279,15 +304,12 @@ _NON_ARTICLE_PATH_HINTS = (
 def _strip_fragment(url: str) -> str:
     try:
         u = urlparse(url)
-        return urlunparse((u.scheme, u.netloc, u.path, u.params, u.query, ""))  # fragment 제거
+        return urlunparse((u.scheme, u.netloc, u.path, u.params, u.query, ""))
     except Exception:
         return (url or "").strip()
 
 
 def _unwrap_redirect_url(url: str) -> str:
-    """
-    1차: 리다이렉터 URL에서 실제 URL이 query param으로 들어있는 경우를 언랩.
-    """
     u = (url or "").strip()
     if not _is_http_url(u):
         return u
@@ -310,10 +332,10 @@ def _unwrap_redirect_url(url: str) -> str:
 
 
 def _extract_canonical_url_from_html(html: str, base_url: str) -> str:
-    """
-    HTML에서 canonical/og:url 추출.
-    """
     try:
+        # Defensive: only parse if it looks like HTML
+        if not isinstance(html, str) or "<" not in html[:2000]:
+            return ""
         soup = BeautifulSoup(html, "html.parser")
 
         link = soup.find("link", attrs={"rel": re.compile(r"\bcanonical\b", re.I)})
@@ -338,11 +360,6 @@ def _extract_canonical_url_from_html(html: str, base_url: str) -> str:
 
 
 def _looks_like_article_url(url: str) -> bool:
-    """
-    URL이 '기사'로 보이는지 휴리스틱 검사.
-    - path가 너무 짧거나 섹션/목록 힌트가 있으면 False
-    - 날짜/긴 숫자(id) 패턴이 있으면 True 가산
-    """
     try:
         pu = urlparse(url)
         path = (pu.path or "").lower()
@@ -473,6 +490,10 @@ def _fetch_html(url: str) -> Optional[str]:
 
 
 def _extract_published_at_from_html(html: str) -> Optional[datetime]:
+    # Defensive: only parse if it looks like HTML
+    if not isinstance(html, str) or "<" not in html[:2000]:
+        return None
+
     soup = BeautifulSoup(html, "html.parser")
 
     for tag_name, attrs in _PUB_META_KEYS:
@@ -495,6 +516,9 @@ def _extract_published_at_from_html(html: str) -> Optional[datetime]:
 
 
 def _extract_og_image_from_html(html: str, base_url: str) -> str:
+    if not isinstance(html, str) or "<" not in html[:2000]:
+        return ""
+
     soup = BeautifulSoup(html, "html.parser")
     candidates: List[str] = []
 
@@ -521,11 +545,13 @@ def _extract_og_image_from_html(html: str, base_url: str) -> str:
 
 
 def _clean_text(s: str) -> str:
-    t = re.sub(r"\s+", " ", (s or "").strip())
-    return t
+    return re.sub(r"\s+", " ", (s or "").strip())
 
 
 def _extract_article_text_from_html(html: str) -> str:
+    if not isinstance(html, str) or "<" not in html[:2000]:
+        return ""
+
     soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup(["script", "style", "noscript", "header", "footer", "aside", "nav"]):
@@ -563,8 +589,7 @@ def _extract_article_text_from_html(html: str) -> str:
                 return text
 
     ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-    text = _clean_text(" ".join(ps))
-    return text
+    return _clean_text(" ".join(ps))
 
 
 def _resolve_published_at_kst_min(article_url: str, candidate: str) -> Optional[str]:
@@ -631,6 +656,7 @@ def _resolve_image_url(article_link: str, candidate_image_url: str, html: Option
 
     return "", True
 
+
 @dataclass
 class NewsNorm:
     title: str
@@ -664,6 +690,7 @@ def _normalize_news_item(n: dict, now_kst: datetime) -> Optional[NewsNorm]:
 
     title = _sanitize_text(n.get("title"), 300).strip()
     summary = _sanitize_text(n.get("summary"), 1000).strip()
+
     pub_str = _resolve_published_at_kst_min(link, _sanitize_text(n.get("published_at"), 100))
     if not pub_str:
         return None
@@ -671,9 +698,9 @@ def _normalize_news_item(n: dict, now_kst: datetime) -> Optional[NewsNorm]:
     dt = _parse_datetime_any(pub_str)
     if not dt:
         return None
-
     if not _is_recent_kst(dt, now_kst):
         return None
+
     if not html:
         html = _fetch_html(link)
 
@@ -681,8 +708,7 @@ def _normalize_news_item(n: dict, now_kst: datetime) -> Optional[NewsNorm]:
 
     content = ""
     if html:
-        content = _extract_article_text_from_html(html)
-        content = content[:CONTENT_MAX_CHARS]
+        content = _extract_article_text_from_html(html)[:CONTENT_MAX_CHARS]
     if len((content or "").strip()) < MIN_ARTICLE_TEXT_CHARS:
         return None
 
@@ -736,7 +762,6 @@ def _rank_and_pick(
     global_seen_urls: set[str],
     global_seen_titles: set[str],
 ) -> List[NewsNorm]:
-
     if not cands:
         return []
 
@@ -770,9 +795,6 @@ def _rank_and_pick(
 
 
 def _final_dedupe_for_save(picked: List[NewsNorm]) -> List[NewsNorm]:
-    """
-    저장 직전 최종 방어 중복 제거(키워드 내부에서 혹시 남아있을 수 있는 중복 제거).
-    """
     out: List[NewsNorm] = []
     seen_u: set[str] = set()
     seen_t: set[str] = set()
@@ -822,6 +844,92 @@ def _refill_news_for_keyword(
     data = _safe_json_load(raw)
     news = data.get("news") or []
     return news if isinstance(news, list) else []
+
+
+def _request_trend_items(client, scope: str, now_kst: datetime) -> List[dict]:
+    """
+    Always returns KEYWORD_LIMIT items with valid keywords (never N/A).
+    Primary strategy: retry LLM (use_search) until keywords are valid.
+    Fallback strategy: if all retries fail, generate deterministic placeholders (non-N/A).
+    """
+    bad_keywords: List[str] = []
+    last_items_raw: List[dict] = []
+
+    for attempt in range(1, MAX_TREND_RETRY_ATTEMPTS + 1):
+        user_msg = _build_user_retry_msg(scope, now_kst, bad_keywords) if attempt > 1 else _build_user_msg(scope, now_kst)
+        msgs = [
+            ChatMessage(role="system", content=TREND_JSON_INSTRUCTION),
+            ChatMessage(role="user", content=user_msg),
+        ]
+
+        raw = _llm_chat(client, msgs)
+        data = _safe_json_load(raw)
+        items_raw = data.get("items") or []
+        if not isinstance(items_raw, list):
+            items_raw = []
+
+        cleaned: List[dict] = []
+        this_bad: List[str] = []
+
+        for x in items_raw:
+            if not isinstance(x, dict):
+                continue
+            kw = _sanitize_keyword(x.get("keyword"))
+            if not _is_valid_keyword(kw):
+                this_bad.append(str(x.get("keyword") or "").strip() or "(empty)")
+                continue
+            cleaned.append(
+                {
+                    "keyword": kw,
+                    "reason": _sanitize_text(x.get("reason"), 2000),
+                    "news_seed": x.get("news") if isinstance(x.get("news"), list) else [],
+                }
+            )
+            if len(cleaned) >= KEYWORD_LIMIT:
+                break
+
+        last_items_raw = cleaned[:]
+        if len(cleaned) == KEYWORD_LIMIT:
+            return cleaned
+
+        bad_keywords.extend(this_bad)
+
+    # Hard fallback: non-N/A deterministic placeholders
+    # Keep scope-specific but short (<=5 chars)
+    if scope == TrendScope.KR:
+        base = ["코스피", "환율", "반도체"]
+    else:
+        base = ["FOMC", "CPI", "AI칩"]
+
+    out: List[dict] = []
+    used: set[str] = set()
+    for kw in base:
+        kw2 = _sanitize_keyword(kw)
+        if _is_valid_keyword(kw2) and kw2 not in used:
+            out.append({"keyword": kw2, "reason": "자동 보정", "news_seed": []})
+            used.add(kw2)
+        if len(out) >= KEYWORD_LIMIT:
+            break
+
+    # If we have some partial valid items from last attempt, prefer them
+    for it in last_items_raw:
+        kw = it.get("keyword") or ""
+        if _is_valid_keyword(kw) and kw not in used:
+            out.insert(0, it)
+            used.add(kw)
+        if len(out) >= KEYWORD_LIMIT:
+            break
+
+    # Ensure exact length
+    out = out[:KEYWORD_LIMIT]
+    while len(out) < KEYWORD_LIMIT:
+        kw = f"이슈{len(out)+1}"
+        kw = _sanitize_keyword(kw)
+        if not _is_valid_keyword(kw):
+            kw = "이슈"
+        out.append({"keyword": kw, "reason": "자동 보정", "news_seed": []})
+
+    return out
 
 
 # =========================================================
@@ -888,32 +996,8 @@ class Command(BaseCommand):
             global_seen_urls: set[str] = set()
             global_seen_titles: set[str] = set()
 
-            user_msg = _build_user_msg(scope, now_kst=now_kst)
-            msgs = [
-                ChatMessage(role="system", content=TREND_JSON_INSTRUCTION),
-                ChatMessage(role="user", content=user_msg),
-            ]
-
-            raw = _llm_chat(client, msgs)
-            data = _safe_json_load(raw)
-            items_raw = data.get("items") or []
-            if not isinstance(items_raw, list):
-                items_raw = []
-
-            items: List[dict] = []
-            for x in items_raw[:KEYWORD_LIMIT]:
-                if not isinstance(x, dict):
-                    continue
-                items.append(
-                    {
-                        "keyword": _sanitize_keyword(x.get("keyword")),
-                        "reason": _sanitize_text(x.get("reason"), 2000),
-                        "news_seed": x.get("news") if isinstance(x.get("news"), list) else [],
-                    }
-                )
-
-            while len(items) < KEYWORD_LIMIT:
-                items.append({"keyword": "N/A", "reason": "데이터 없음", "news_seed": []})
+            # Always returns KEYWORD_LIMIT valid keywords (never N/A)
+            items: List[dict] = _request_trend_items(client=client, scope=scope, now_kst=now_kst)
 
             for it in items:
                 kw = it["keyword"]
@@ -934,12 +1018,13 @@ class Command(BaseCommand):
                 attempts = 0
                 while len(candidates) < CANDIDATE_POOL_LIMIT and attempts < MAX_REFILL_ATTEMPTS:
                     attempts += 1
+
                     refill = _refill_news_for_keyword(
                         client=client,
                         scope=scope,
                         keyword=kw,
                         now_kst=now_kst,
-                        exclude_urls=used_urls,  # URL 위주로만 exclude 전달 (LLM용)
+                        exclude_urls=used_urls,
                         batch_size=BATCH_SIZE,
                     )
                     if not refill:
@@ -965,7 +1050,6 @@ class Command(BaseCommand):
                 )
 
                 picked = _final_dedupe_for_save(picked)
-
                 it["picked_news"] = picked
 
                 self.stdout.write(
@@ -980,11 +1064,11 @@ class Command(BaseCommand):
             )
 
         self.stdout.write("=========================================")
-        self.stdout.write("🔎 Auto-run: analyze_trend_keyword_news (pending only)")
+        self.stdout.write("Auto-run: analyze_trend_keyword_news (pending only)")
         self.stdout.write("=========================================")
 
         try:
             call_command("analyze_trend_keyword_news")
-            self.stdout.write(self.style.SUCCESS("✅ Auto analysis finished: analyze_trend_keyword_news"))
+            self.stdout.write(self.style.SUCCESS("Auto analysis finished: analyze_trend_keyword_news"))
         except Exception as e:
-            self.stdout.write(self.style.ERROR(f"❌ Auto analysis failed: {e}"))
+            self.stdout.write(self.style.ERROR(f"Auto analysis failed: {e}"))

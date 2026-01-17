@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, Optional
 
 from django.conf import settings
@@ -20,6 +21,9 @@ MAX_OUTPUT_TOKENS = int(getattr(settings, "GEMINI_TREND_ANALYSIS_MAX_TOKENS", 25
 
 # Lv 분석 시, 너무 긴 본문은 비용/시간이 커져서 잘라서 보냄(원하면 늘리면 됨)
 MAX_INPUT_CHARS = int(getattr(settings, "GEMINI_TREND_ANALYSIS_MAX_INPUT_CHARS", 6000))
+
+# ✅ 번역 제목 최대 길이
+KOR_TITLE_MAX_CHARS = int(getattr(settings, "TREND_NEWS_KOR_TITLE_MAX_CHARS", 28))
 
 
 # =========================================================
@@ -111,6 +115,100 @@ def _normalize_full(full: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =========================================================
+# Title helpers (NEW)
+# =========================================================
+def _looks_korean(s: str) -> bool:
+    """
+    한글이 포함되어 있으면 True로 간주.
+    (완벽한 언어 판별이 아니라 '한글이 있냐 없냐' 기준)
+    """
+    if not s:
+        return False
+    return bool(re.search(r"[가-힣]", s))
+
+
+def _clean_one_line(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("\n", " ").replace("\r", " ")
+    return s.strip()
+
+
+def _build_korean_title_prompt(title: str, content: str) -> str:
+    """
+    ✅ 요구사항:
+    - 원문 title이 한글이 아니면 -> 한국어로 간단 요약 제목 생성
+    - 다/이다 체 (요체 금지)
+    - 짧고 기사 제목처럼 (자극적 이모지/장식 금지)
+    - 출력은 JSON만
+    """
+    t = _clean_one_line(title)
+    c = _clean_one_line((content or "")[:MAX_INPUT_CHARS])
+
+    return f"""다음 뉴스의 제목을 한국어 기사 제목 형태로 아주 짧게 바꿔서 JSON으로만 출력한다.
+반드시 "다/이다" 체를 사용한다. "~요/~합니다" 같은 요체는 금지한다.
+이모지/장식문자/따옴표/불릿/번호/줄바꿈을 넣지 않는다.
+가능하면 {KOR_TITLE_MAX_CHARS}자 이내로 만든다.
+
+[입력]
+원제목: {t}
+본문(참고): {c}
+
+[출력(JSON만)]
+{{"title_ko": "여기에 한국어 제목을 작성한다"}}""".strip()
+
+
+def _maybe_overwrite_korean_title(*, client, news: TrendKeywordNews) -> Optional[str]:
+    """
+    news.title에 한글이 없으면 -> 한국어 제목 생성 후 덮어쓰기 저장.
+    성공 시 새 제목 반환, 실패 시 None.
+    """
+    original_title = (news.title or "").strip()
+    if not original_title:
+        return None
+
+    # ✅ 한글이 조금이라도 있으면 그대로 둠
+    if _looks_korean(original_title):
+        return None
+
+    content_to_ref = (news.content or "").strip() or (news.summary or "").strip()
+    if not content_to_ref:
+        # 본문이 없으면 제목만으로도 시도는 가능하지만 품질이 낮을 수 있음.
+        content_to_ref = original_title
+
+    prompt = _build_korean_title_prompt(original_title, content_to_ref)
+    msgs = [
+        ChatMessage(
+            role="system",
+            content="당신은 JSON만 출력한다. title_ko는 한국어 기사 제목이며 반드시 다/이다 체를 사용한다.",
+        ),
+        ChatMessage(role="user", content=prompt),
+    ]
+
+    raw = _llm_chat(client, msgs)
+    obj = _safe_json_load(raw)
+    if not obj:
+        return None
+
+    title_ko = _clean_one_line(str(obj.get("title_ko") or ""))
+    if not title_ko:
+        return None
+
+    # 방어: 너무 길면 자름
+    if KOR_TITLE_MAX_CHARS > 0 and len(title_ko) > KOR_TITLE_MAX_CHARS:
+        title_ko = title_ko[:KOR_TITLE_MAX_CHARS].rstrip()
+
+    # 마지막 방어: 여전히 한글이 하나도 없으면 저장하지 않음
+    if not _looks_korean(title_ko):
+        return None
+
+    # ✅ DB에 덮어쓰기
+    news.title = title_ko
+    news.save(update_fields=["title"])
+    return title_ko
+
+
+# =========================================================
 # Prompt (Gemini)
 # =========================================================
 def _build_prompt(title: str, content: str) -> str:
@@ -118,9 +216,6 @@ def _build_prompt(title: str, content: str) -> str:
     c = (content or "").strip()
     c = c[:MAX_INPUT_CHARS]
 
-    # ✅ 변경 포인트:
-    # - lv1~lv5 summary는 반드시 깔끔한 1줄
-    # - 이모티콘/이모지/특수기호/불릿/번호/줄바꿈 금지 강제
     return f"""다음 뉴스 기사를 심층 분석하여 아래 형식의 JSON으로만 응답해 주세요.
 다른 말은 덧붙이지 말고 반드시 JSON 데이터만 출력해 주세요. (마크다운/코드블록 금지)
 
@@ -265,7 +360,7 @@ def analyze_trend_keyword_news(
       - TrendKeywordNews.analyzed_at
       - TrendKeywordNewsAnalysis (lv1~lv5) upsert
 
-    ✅ 변경: 레벨별 summary가 "이모티콘/장식 없이 깔끔한 1줄"로 생성되도록 프롬프트 지침만 강화
+    ✅ 추가: news.title이 한글이 아니면 -> 한국어 제목(다/이다체)으로 짧게 생성해 title에 덮어쓴 후 분석 진행
     """
     content_to_analyze = (news.content or "").strip() or (news.summary or "").strip()
     if not content_to_analyze:
@@ -273,6 +368,10 @@ def analyze_trend_keyword_news(
 
     client = get_gemini_client()
 
+    #  NEW: 비한글 제목이면 한국어 제목으로 덮어쓰기
+    _maybe_overwrite_korean_title(client=client, news=news)
+
+    # 덮어쓴 제목을 포함해 분석 진행
     prompt = _build_prompt(news.title, content_to_analyze)
     msgs = [
         ChatMessage(

@@ -1,4 +1,3 @@
-# apps/reco/management/commands/analyze_trend_keyword_news.py
 from __future__ import annotations
 
 from datetime import date

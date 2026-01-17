@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -110,6 +111,8 @@ class Command(BaseCommand):
         re.compile(r"/NewsView/"),
         re.compile(r"/news/view/"),
         re.compile(r"/news/article/"),
+        re.compile(r"news_read\.naver"),
+        re.compile(r"/news/"),  # Broad match for MK etc, trusted by NON_ARTICLE checks
     ]
 
     NON_ARTICLE_URL_RE_LIST = [
@@ -224,11 +227,31 @@ class Command(BaseCommand):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # Environment Auto-fix for WSL/Local without Docker DNS
+        import socket
+        import os
+        from django.db import connections
+        
+        db_host = os.environ.get("POSTGRES_HOST", "db")
+        if db_host == "db":
+            try:
+                socket.gethostbyname("db")
+            except socket.gaierror:
+                self.stdout.write(self.style.WARNING("⚠️ Host 'db' not resolving. Switching to 'localhost' for WSL/Local execution."))
+                # Patch the default connection settings
+                new_settings = settings.DATABASES["default"].copy()
+                new_settings["HOST"] = "localhost"
+                connections.databases["default"] = new_settings
+
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": self.USER_AGENT})
 
         # OpenAI client 재사용
         self.oa_client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+
+        # [Added] ThreadPoolExecutor for background analysis
+        # max_workers=5 정도로 설정 (API Rate limit 고려)
+        self.executor = ThreadPoolExecutor(max_workers=5)
 
     # -------------------------------
     # OpenAI embedding
@@ -248,6 +271,7 @@ class Command(BaseCommand):
         if allow:
             qs = {k: v for k, v in qs.items() if k in allow}
         return qs
+
 
     def _canonical_url(self, url: str) -> str:
         u = (url or "").strip()
@@ -825,7 +849,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR(f"⚠️ 임베딩 생성 실패: {e}"))
             return 0
 
-        # DB create만 atomic, 분석은 트랜잭션 밖
+        # DB create만 atomic, 분석은 트랜잭션 밖 (or Parallel)
         try:
             with transaction.atomic():
                 article = NewsArticle.objects.create(
@@ -840,18 +864,109 @@ class Command(BaseCommand):
                     embedding=vector,
                 )
         except Exception as e:
-            self.stdout.write(self.style.ERROR(f"    -> DB 저장 실패: {e}"))
+            print(f"    -> DB 저장 실패: {e}")
             return 0
 
+        # [Changed] Sync -> Async execution via ThreadPoolExecutor
+        # analyze_news(article, save_to_db=True)
+        self.executor.submit(self._analyze_and_log, article, source_name)
+        
+        return 1
+
+    def _analyze_and_log(self, article: NewsArticle, source_name: str):
+        """
+        Background worker function to analyze news and log result.
+        """
         try:
             from news.services.analyze_news import analyze_news
-
+            
+            # Note: analyze_news uses its own transaction/DB logic internally.
             analyze_news(article, save_to_db=True)
-            self.stdout.write(f"  + [{source_name}] [New] {title[:50]}... (analyzed)")
+            self.stdout.write(f"  + [{source_name}] [Analyzed] {article.title[:30]}...")
         except Exception as e:
-            self.stdout.write(self.style.WARNING(f"  ! [{source_name}] 저장은 성공, 분석 실패: {e}"))
+            self.stdout.write(self.style.WARNING(f"  ! [{source_name}] Analysis failed: {e}"))
 
-        return 1
+    # =========================================================================
+    # Parallel Processor
+    # =========================================================================
+    def _process_single_item(self, item: CandidateItem, source_name: str, is_trusted: bool) -> Tuple[str, str]:
+        try:
+            # 1) Duplicate check
+            canonical = self._canonical_url(item.link)
+            if self._is_duplicate(title=item.title, canonical_url=canonical):
+                return "duplicate", ""
+
+            # 2) Fetch detail
+            og_img, og_desc, pub_dt, content_text, is_article_like = self._fetch_detail_signals(item.link)
+            
+            # Debug log
+            # print(f"[{source_name}] {item.title[:10]}... | Img: {bool(item.image_url)}/{bool(og_img)} | Content: {len(content_text) if content_text else 0} | ArticleLike: {is_article_like}")
+
+            # 3) Validation
+            if not is_trusted and (not is_article_like and not pub_dt):
+                return "not_article", ""
+            
+            # 4) Merge & Check Image (Strict)
+            raw_img = og_img or item.image_url
+            image_url = self._pick_valid_image_url(raw_img)
+            
+            if not image_url:
+                # User request: "이미지 없는 뉴스도 크롤링이 됨" -> Fix: skip if no image
+                return "no_image", ""
+
+            # 5) Summary logic
+            summary = item.summary
+            if not summary and og_desc:
+                summary = og_desc
+            if not summary:
+                summary = item.title
+
+            # 6) Save
+            saved = self.save_article(
+                title=item.title,
+                summary=summary,
+                link=item.link,
+                image_url=image_url,
+                source_name=source_name,
+                sector="금융/경제",
+                market="Korea",
+                content=content_text,
+                published_at=pub_dt or timezone.now(),
+            )
+            return ("saved", "") if saved > 0 else ("db_error", "Save returned 0")
+        except Exception as e:
+            # print(f"Error in worker: {e}")
+            return "error", str(e)
+
+    def _process_batch_parallel(self, candidates: List[CandidateItem], source_name: str, is_trusted: bool = False) -> int:
+        if not candidates:
+            return 0
+        
+        self.stdout.write(f"  > Processing {len(candidates)} items in parallel (Trusted={is_trusted})...")
+        
+        stats = {"saved": 0, "duplicate": 0, "no_image": 0, "not_article": 0, "error": 0, "db_error": 0}
+
+        # Parallel fetch
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_item = {
+                executor.submit(self._process_single_item, c, source_name, is_trusted): c 
+                for c in candidates
+            }
+            for future in as_completed(future_to_item):
+                try:
+                    res, msg = future.result() # returns (status, msg)
+                    stats[res] = stats.get(res, 0) + 1
+                    if res == "saved":
+                        print(".", end="", flush=True)
+                    # elif res in ("error", "db_error"):
+                    #    print(f"\n[ERR] {msg}", flush=True)
+                except Exception as e:
+                    self.stdout.write(self.style.ERROR(f"Worker Error: {e}"))
+                    stats["error"] += 1
+        
+        print("") # new line
+        self.stdout.write(f"    [Done] Saved: {stats['saved']}, Duplicates: {stats['duplicate']}, NoImage: {stats['no_image']}, Errors: {stats['error'] + stats['db_error']}")
+        return stats["saved"]
 
     # =========================================================================
     # Candidate builders (무분별 URL 생성 방지)
@@ -941,6 +1056,9 @@ class Command(BaseCommand):
 
         self.stdout.write("=========================================")
         self.stdout.write(self.style.SUCCESS(f"✅ 통합 크롤링 완료. (총 신규 저장: {total_saved}개)"))
+        self.stdout.write("⏳ 백그라운드 분석 작업이 완료될 때까지 대기합니다...")
+        self.executor.shutdown(wait=True)
+        self.stdout.write("🎉 모든 작업 종료.")
         self.stdout.write("=========================================")
 
     # =========================================================================
@@ -949,77 +1067,58 @@ class Command(BaseCommand):
     def crawl_naver(self) -> int:
         self.stdout.write("\n>>> [1/4] 네이버 금융 뉴스 크롤링 중...")
         url = self.NAVER_LIST_URL
-
-        saved = 0
+        
+        candidates = []
         try:
             res = self.session.get(url, timeout=10)
             res.encoding = "cp949"
             soup = BeautifulSoup(res.text, "html.parser")
 
             items = soup.select(".mainNewsList li")[: self.MAX_CANDIDATES_PER_SOURCE]
-
+            
             for li in items:
-                if saved >= self.MAX_PER_SOURCE:
-                    break
-                try:
-                    a = li.select_one(".articleSubject a")
-                    s = li.select_one(".articleSummary")
-                    if not a:
-                        continue
-
-                    title = a.get_text(strip=True)
-                    link = urljoin("https://finance.naver.com", a.get("href") or "")
-                    link = self._normalize_url(link)
-
-                    image_url = None
-                    img = li.select_one("img")
-                    if img and img.get("src"):
-                        base = (img.get("src") or "").split("?")[0]
-                        image_url = f"{base}?type=w660"
-
-                    raw_summary = s.get_text("\n", strip=True) if s else ""
-                    summary = raw_summary.split("\n")[0].strip() if raw_summary else title
-
-                    og_img, og_desc, pub_dt, content_text, is_article_like = self._fetch_detail_signals(link)
-                    if not is_article_like and not pub_dt:
-                        continue
-
-                    if og_desc:
-                        summary = og_desc.strip()
-
-                    image_url = self._pick_valid_image_url(og_img or image_url)
-
-                    inc = self.save_article(
-                        title=title,
-                        summary=summary,
-                        link=link,
-                        image_url=image_url,
-                        source_name="Naver",
-                        sector="금융/경제",
-                        market="Korea",
-                        content=content_text,
-                        published_at=pub_dt or timezone.now(),
-                    )
-                    saved += inc
-                    time.sleep(self.SLEEP_BETWEEN_ITEMS)
-                except Exception:
+                a = li.select_one(".articleSubject a")
+                s = li.select_one(".articleSummary")
+                if not a:
                     continue
+
+                title = a.get_text(strip=True)
+                # handle relative url
+                href = a.get("href") or ""
+                link = urljoin("https://finance.naver.com", href)
+                link = self._normalize_url(link)
+
+                image_url = None
+                img = li.select_one("img")
+                if img and img.get("src"):
+                    base = (img.get("src") or "").split("?")[0]
+                    image_url = f"{base}?type=w660"
+
+                raw_summary = s.get_text("\n", strip=True) if s else ""
+                summary = raw_summary.split("\n")[0].strip() if raw_summary else title
+                
+                candidates.append(CandidateItem(
+                    title=title,
+                    link=link,
+                    summary=summary,
+                    image_url=image_url
+                ))
 
         except Exception as e:
             self.stdout.write(self.style.ERROR(f"❌ 네이버 크롤링 오류: {e}"))
-
-        return saved
+            return 0
+        
+        return self._process_batch_parallel(candidates, "Naver", is_trusted=True)
 
     # =========================================================================
     # 2) Yonhap Infomax
     # =========================================================================
     def crawl_yonhap_infomax(self) -> int:
         self.stdout.write("\n>>> [2/4] 연합인포맥스 크롤링 중...")
-        url = self.YONHAP_LIST_URL
-
-        saved = 0
+        
+        candidates = []
         try:
-            res = self.session.get(url, timeout=10)
+            res = self.session.get(self.YONHAP_LIST_URL, timeout=10)
             res.encoding = res.apparent_encoding
             soup = BeautifulSoup(res.text, "html.parser")
 
@@ -1032,49 +1131,21 @@ class Command(BaseCommand):
                     container_selectors=["main", ".article-list", "#container", "body"],
                 )
             )
-
-            for it in candidates:
-                if saved >= self.MAX_PER_SOURCE:
-                    break
-                try:
-                    og_img, og_desc, pub_dt, content_text, is_article_like = self._fetch_detail_signals(it.link)
-                    if not is_article_like and not pub_dt:
-                        continue
-
-                    summary = (og_desc or it.title).strip()
-                    image_url = self._pick_valid_image_url(og_img)
-
-                    inc = self.save_article(
-                        title=it.title,
-                        summary=summary,
-                        link=it.link,
-                        image_url=image_url,
-                        source_name="Infomax",
-                        sector="금융/경제",
-                        market="Korea",
-                        content=content_text,
-                        published_at=pub_dt or timezone.now(),
-                    )
-                    saved += inc
-                    time.sleep(self.SLEEP_BETWEEN_ITEMS)
-                except Exception:
-                    continue
-
         except Exception as e:
             self.stdout.write(self.style.ERROR(f"❌ 연합인포맥스 크롤링 오류: {e}"))
+            return 0
 
-        return saved
+        return self._process_batch_parallel(candidates, "Infomax")
 
     # =========================================================================
     # 3) Hankyung
     # =========================================================================
     def crawl_hankyung(self) -> int:
         self.stdout.write("\n>>> [3/4] 한국경제(Hankyung) 크롤링 중...")
-        url = self.HANKYUNG_LIST_URL
-
-        saved = 0
+        
+        candidates = []
         try:
-            res = self.session.get(url, timeout=10)
+            res = self.session.get(self.HANKYUNG_LIST_URL, timeout=10)
             soup = BeautifulSoup(res.text, "html.parser")
 
             candidates = list(
@@ -1085,49 +1156,21 @@ class Command(BaseCommand):
                     container_selectors=["main", ".news-list", ".section-content", "#container", "body"],
                 )
             )
-
-            for it in candidates:
-                if saved >= self.MAX_PER_SOURCE:
-                    break
-                try:
-                    og_img, og_desc, pub_dt, content_text, is_article_like = self._fetch_detail_signals(it.link)
-                    if not is_article_like and not pub_dt:
-                        continue
-
-                    summary = (og_desc or it.title).strip()
-                    image_url = self._pick_valid_image_url(og_img)
-
-                    inc = self.save_article(
-                        title=it.title,
-                        summary=summary,
-                        link=it.link,
-                        image_url=image_url,
-                        source_name="Hankyung",
-                        sector="금융/경제",
-                        market="Korea",
-                        content=content_text,
-                        published_at=pub_dt or timezone.now(),
-                    )
-                    saved += inc
-                    time.sleep(self.SLEEP_BETWEEN_ITEMS)
-                except Exception:
-                    continue
-
         except Exception as e:
             self.stdout.write(self.style.ERROR(f"❌ 한국경제 크롤링 오류: {e}"))
+            return 0
 
-        return saved
+        return self._process_batch_parallel(candidates, "Hankyung")
 
     # =========================================================================
     # 4) MK
     # =========================================================================
     def crawl_mk(self) -> int:
         self.stdout.write("\n>>> [4/4] 매일경제(MK) 크롤링 중...")
-        url = self.MK_LIST_URL
-
-        saved = 0
+        
+        candidates = []
         try:
-            res = self.session.get(url, timeout=10)
+            res = self.session.get(self.MK_LIST_URL, timeout=10)
             soup = BeautifulSoup(res.text, "html.parser")
 
             candidates = list(
@@ -1138,35 +1181,8 @@ class Command(BaseCommand):
                     container_selectors=["main", ".news_list", ".sec_body", "#container", "body"],
                 )
             )
-
-            for it in candidates:
-                if saved >= self.MAX_PER_SOURCE:
-                    break
-                try:
-                    og_img, og_desc, pub_dt, content_text, is_article_like = self._fetch_detail_signals(it.link)
-                    if not is_article_like and not pub_dt:
-                        continue
-
-                    summary = (og_desc or it.title).strip()
-                    image_url = self._pick_valid_image_url(og_img)
-
-                    inc = self.save_article(
-                        title=it.title,
-                        summary=summary,
-                        link=it.link,
-                        image_url=image_url,
-                        source_name="MK",
-                        sector="금융/경제",
-                        market="Korea",
-                        content=content_text,
-                        published_at=pub_dt or timezone.now(),
-                    )
-                    saved += inc
-                    time.sleep(self.SLEEP_BETWEEN_ITEMS)
-                except Exception:
-                    continue
-
         except Exception as e:
             self.stdout.write(self.style.ERROR(f"❌ 매일경제 크롤링 오류: {e}"))
+            return 0
 
-        return saved
+        return self._process_batch_parallel(candidates, "MK")

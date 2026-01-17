@@ -14,7 +14,7 @@ class ChatMessage:
 
 
 class GeminiClient:
-    def __init__(self, model: str = "gemini-2.0-flash-exp") -> None:
+    def __init__(self, model: str = "gemini-2.0-flash-001") -> None:
         """
         참고: 검색 기능을 사용하려면 'gemini-1.5-pro', 'gemini-2.0-flash' 등
         Search Grounding을 지원하는 모델을 사용해야 합니다.
@@ -82,5 +82,5 @@ class GeminiClient:
 def get_gemini_client() -> GeminiClient:
     # 검색 기능을 쓰려면 모델명이 중요합니다. (최신 모델 권장)
     # 예: gemini-2.0-flash-exp, gemini-1.5-pro-002 등
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-exp")
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-001")
     return GeminiClient(model=model)
